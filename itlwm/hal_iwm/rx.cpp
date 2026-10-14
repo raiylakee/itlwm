@@ -1149,7 +1149,11 @@ iwm_rx_pkt(struct iwm_softc *sc, struct iwm_rx_data *data, struct mbuf_list *ml)
                 }
                 
                 sc->sc_uc.uc_intr = 1;
+#ifdef AIRPORT_WCL
+                getMainCommandGate()->commandWakeup(&sc->sc_uc.uc_intr);
+#else
                 wakeupOn(&sc->sc_uc);
+#endif
                 break;
             }
                 
@@ -1158,6 +1162,9 @@ iwm_rx_pkt(struct iwm_softc *sc, struct iwm_rx_data *data, struct mbuf_list *ml)
                 SYNC_RESP_STRUCT(phy_db_notif, pkt, struct iwm_calib_res_notif_phy_db *);
                 iwm_phy_db_set_section(sc, phy_db_notif);
                 sc->sc_init_complete |= IWM_CALIB_COMPLETE;
+#ifdef AIRPORT_WCL
+                getMainCommandGate()->commandWakeup(&sc->sc_init_complete);
+#endif
                 //                wakeupOn(&sc->sc_init_complete);
                 break;
             }
@@ -1255,7 +1262,11 @@ iwm_rx_pkt(struct iwm_softc *sc, struct iwm_rx_data *data, struct mbuf_list *ml)
                 
             case IWM_INIT_COMPLETE_NOTIF:
                 sc->sc_init_complete |= IWM_INIT_COMPLETE;
+#ifdef AIRPORT_WCL
+                getMainCommandGate()->commandWakeup(&sc->sc_init_complete);
+#else
                 wakeupOn(&sc->sc_init_complete);
+#endif
                 break;
                 
             case IWM_SCAN_OFFLOAD_COMPLETE: {
