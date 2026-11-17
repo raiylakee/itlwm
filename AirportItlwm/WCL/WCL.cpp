@@ -177,6 +177,16 @@ IOReturn AirportItlwmSkywalkInterface::wclCommand(OSObject *, void *a0, void *a1
         case 15:
             return self->fHalService->setScanHomeAwayTime(
                 AirportWCL::read32(static_cast<const uint8_t *>(a2)));
+        case 16: {
+            auto ps = static_cast<apple80211_powersave_data *>(a2);
+            if (!ps)
+                return kIOReturnBadArgument;
+            return self->fHalService->setPowerSaveMode(
+                ps->powersave_level != APPLE80211_POWERSAVE_MODE_DISABLED ? 1 : 0);
+        }
+        case 17:
+            return self->fHalService->setPowerSaveMode(
+                uintptr_t(a2) ? 1 : 0);
         case 12:
             self->handleWCLEvent(int(uintptr_t(a2)), nullptr);
             return kIOReturnSuccess;

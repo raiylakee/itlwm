@@ -123,6 +123,7 @@
 #ifdef AIRPORT_WCL
 #include <kern/clock.h>
 #endif
+#include <pexpert/pexpert.h>
 #include <net/ethernet.h>
 #include <IOKit/IOCommandGate.h>
 #include <net80211/ieee80211_priv.h>
@@ -4664,6 +4665,30 @@ iwm_attach(struct iwm_softc *sc, struct pci_attach_args *pa)
     sc->sc_pct = pa->pa_pc;
     sc->sc_pcitag = pa->pa_tag;
     sc->sc_dmat = pa->pa_dmat;
+
+    /*
+     * Native-behavior defaults. Connected power save stays off until the
+     * system asks for it (setPM_MODE), and can be killed at boot with
+     * itlpmoff=1 if a firmware revision misbehaves while dozing. Roaming
+     * thresholds mirror the OpenBSD net80211 defaults and can be tuned
+     * with itlwm_rssi_2g=<dBm, positive> / itlwm_rssi_5g=<dBm, positive>.
+     */
+    sc->sc_pwrsave_mode = 0;
+    sc->sc_pwrsave_disabled = 0;
+    sc->sc_rssi_thres_2g = -60;
+    sc->sc_rssi_thres_5g = -70;
+    {
+        int ps_off = 0;
+        uint32_t rssi = 0;
+        if (PE_parse_boot_argn("itlpmoff", &ps_off, sizeof(ps_off)))
+            sc->sc_pwrsave_disabled = 1;
+        if (PE_parse_boot_argn("itlwm_rssi_2g", &rssi, sizeof(rssi)) &&
+            rssi >= 10 && rssi <= 90)
+            sc->sc_rssi_thres_2g = -(int)rssi;
+        if (PE_parse_boot_argn("itlwm_rssi_5g", &rssi, sizeof(rssi)) &&
+            rssi >= 10 && rssi <= 90)
+            sc->sc_rssi_thres_5g = -(int)rssi;
+    }
     
     //    rw_init(&sc->ioctl_rwl, "iwmioctl");
     
@@ -5061,6 +5086,13 @@ iwm_attach(struct iwm_softc *sc, struct pci_attach_args *pa)
     
     ic->ic_node_alloc = iwm_node_alloc;
     ic->ic_bgscan_start = iwm_bgscan;
+    /*
+     * net80211 starts a background scan when a beacon arrives below these
+     * thresholds (ieee80211_input.c) and then roams to the best cached
+     * BSS (ieee80211_node.c). Use thresholds that Apple's roam profile
+     * cannot reach us through yet, but that the user can tune.
+     */
+    ic->ic_node_checkrssi = iwm_node_checkrssi;
     ic->ic_set_key = iwm_set_key;
     ic->ic_delete_key = iwm_delete_key;
     

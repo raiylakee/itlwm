@@ -632,6 +632,19 @@ struct iwm_softc {
 
 	struct iwm_bf_data sc_bf;
 
+	/*
+	 * Connected power save. Apple asks for it through setPM_MODE; the
+	 * OpenBSD PS machinery below then sets POWER_MANAGEMENT_ENA_MSK and
+	 * lets the firmware doze between DTIMs. sc_pwrsave_disabled is the
+	 * itlpmoff boot-arg kill switch.
+	 */
+	int sc_pwrsave_mode;
+	int sc_pwrsave_disabled;
+
+	/* Roam trigger thresholds in dBm (itlwm_rssi_2g / itlwm_rssi_5g). */
+	int sc_rssi_thres_2g;
+	int sc_rssi_thres_5g;
+
 	int sc_tx_timer[IWM_MAX_QUEUES];
 	int sc_rx_ba_sessions;
 

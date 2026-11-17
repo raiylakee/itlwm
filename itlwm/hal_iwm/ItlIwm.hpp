@@ -65,6 +65,9 @@ public:
         return kIOReturnSuccess;
     }
 #endif
+    /* Connected power save, driven by Apple's setPM_MODE. */
+    IOReturn setPowerSaveMode(uint32_t mode) override;
+    uint32_t getPowerSaveMode() override;
     
     static bool intrFilter(OSObject *object, IOFilterInterruptEventSource *src);
     static IOReturn _iwm_start_task(OSObject *target, void *arg0, void *arg1, void *arg2, void *arg3);
@@ -336,6 +339,7 @@ public:
                                 struct iwm_mac_power_cmd *);
     int    iwm_power_mac_update_mode(struct iwm_softc *, struct iwm_node *);
     int    iwm_power_update_device(struct iwm_softc *);
+    int    iwm_power_set_mode(struct iwm_softc *, int);
     int    iwm_enable_beacon_filter(struct iwm_softc *, struct iwm_node *);
     int    iwm_disable_beacon_filter(struct iwm_softc *);
     int    iwm_add_sta_cmd(struct iwm_softc *, struct iwm_node *, int, unsigned int);
@@ -367,6 +371,8 @@ public:
     void    iwm_del_task(struct iwm_softc *, struct taskq *, struct task *);
     int    iwm_scan(struct iwm_softc *);
     static int    iwm_bgscan(struct ieee80211com *);
+    static int    iwm_node_checkrssi(struct ieee80211com *,
+                                     const struct ieee80211_node *);
     int    iwm_umac_scan_abort(struct iwm_softc *);
     int    iwm_lmac_scan_abort(struct iwm_softc *);
     int    iwm_scan_abort(struct iwm_softc *);

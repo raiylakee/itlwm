@@ -49,6 +49,12 @@ public:
 #ifdef AIRPORT_WCL
     virtual IOReturn setScanHomeAwayTime(uint32_t) { return kIOReturnUnsupported; }
 #endif
+    /*
+     * Connected power save. 0 = off/active, non-zero = let the firmware
+     * doze between DTIMs (Apple's setPM_MODE / setPOWERSAVE).
+     */
+    virtual IOReturn setPowerSaveMode(uint32_t) { return kIOReturnUnsupported; }
+    virtual uint32_t getPowerSaveMode() { return 0; }
     
     virtual ItlDriverInfo *getDriverInfo() = 0;
     

@@ -13,10 +13,63 @@
 #include <net80211/ieee80211_node.h>
 #include <net80211/ieee80211_ioctl.h>
 #include <net80211/ieee80211_priv.h>
+#include <pexpert/pexpert.h>
 
 #ifdef AIRPORT_WCL
 extern IOCommandGate *_fCommandGate;
 #endif
+
+/*
+ * Map an ISO 3166 country code onto Apple's regulatory locale. The driver
+ * used to hardcode FCC; that is correct for the US but wrong for ID/JP/KR
+ * and the ETSI countries, and airportd uses this value to decide which
+ * channels/powers are legal.
+ */
+static u_int32_t
+appleLocaleForCountryCode(const char *in)
+{
+    static const char *const etsi[] = {
+        "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR",
+        "DE", "GR", "HU", "IE", "IT", "LV", "LT", "LU", "MT", "NL",
+        "NO", "PL", "PT", "RO", "SK", "SI", "ES", "SE", "CH", "GB",
+        "IS", "LI", "TR", "UA", nullptr
+    };
+    static const char *const apac[] = {
+        "AU", "NZ", "SG", "HK", "IN", "MY", "TH", "PH", "VN", "TW",
+        "CN", "MO", "PK", "BD", "LK", nullptr
+    };
+    static const char *const fcc[] = {
+        "US", "CA", "MX", "BR", "AR", "CL", "CO", "PE", "CR", "PA",
+        "DO", "GT", "UY", "PY", "BO", "EC", "VE", "PR", nullptr
+    };
+    char cc[3] = { 0, 0, 0 };
+    unsigned i;
+
+    if (!in || !in[0] || !in[1])
+        return APPLE80211_LOCALE_FCC;
+
+    cc[0] = (in[0] >= 'a' && in[0] <= 'z') ? in[0] - 0x20 : in[0];
+    cc[1] = (in[1] >= 'a' && in[1] <= 'z') ? in[1] - 0x20 : in[1];
+
+    if (strcmp(cc, "ID") == 0)
+        return APPLE80211_LOCALE_INDONESIA;
+    if (strcmp(cc, "JP") == 0)
+        return APPLE80211_LOCALE_JAPAN;
+    if (strcmp(cc, "KR") == 0)
+        return APPLE80211_LOCALE_KOREA;
+    for (i = 0; etsi[i] != nullptr; i++)
+        if (strcmp(cc, etsi[i]) == 0)
+            return APPLE80211_LOCALE_ETSI;
+    for (i = 0; apac[i] != nullptr; i++)
+        if (strcmp(cc, apac[i]) == 0)
+            return APPLE80211_LOCALE_APAC;
+    for (i = 0; fcc[i] != nullptr; i++)
+        if (strcmp(cc, fcc[i]) == 0)
+            return APPLE80211_LOCALE_FCC;
+
+    /* Unknown/unspecified ("ZZ") keeps the previous FCC default. */
+    return APPLE80211_LOCALE_FCC;
+}
 
 #define super IO80211InfraProtocol
 OSDefineMetaClassAndStructors(AirportItlwmSkywalkInterface, IO80211InfraProtocol);
@@ -731,6 +784,67 @@ getAP_IE_LIST(struct apple80211_ap_ie_data *data)
 }
 
 IOReturn AirportItlwmSkywalkInterface::
+getDTIM_INT(struct apple80211_dtim_int_data *dd)
+{
+    struct ieee80211com *ic = fHalService->get80211Controller();
+    if (!dd)
+        return kIOReturnError;
+    dd->version = APPLE80211_VERSION;
+    /*
+     * The associated node carries the DTIM period advertised by the AP;
+     * ic_dtim_period is the value net80211 last programmed while running.
+     */
+    if (ic->ic_state == IEEE80211_S_RUN && ic->ic_bss != NULL)
+        dd->interval = ic->ic_bss->ni_dtimperiod;
+    else
+        dd->interval = ic->ic_dtim_period;
+    return kIOReturnSuccess;
+}
+
+IOReturn AirportItlwmSkywalkInterface::
+getSTATS(struct apple80211_stats_data *sd)
+{
+    struct ieee80211com *ic = fHalService->get80211Controller();
+    if (!sd)
+        return kIOReturnError;
+
+    memset(sd, 0, sizeof(*sd));
+    sd->version = APPLE80211_VERSION;
+
+#ifdef AIRPORT_WCL
+    /* Per-AC software counters maintained by the TX/RX fast paths. */
+    for (unsigned i = 0; i < 4; i++) {
+        sd->tx_frame_count += (u_int32_t)ic->ic_wcl_tx_packets[i];
+        sd->rx_frame_count += (u_int32_t)ic->ic_wcl_rx_packets[i];
+    }
+#endif
+
+    /* Drop counters from net80211; cheap and truthful diagnostics. */
+    sd->tx_errors = ic->ic_stats.is_tx_nombuf + ic->ic_stats.is_tx_nonode +
+                    ic->ic_stats.is_tx_unknownmgt + ic->ic_stats.is_tx_noauth;
+    sd->rx_errors = ic->ic_stats.is_rx_badversion +
+                    ic->ic_stats.is_rx_tooshort +
+                    ic->ic_stats.is_rx_wrongbss +
+                    ic->ic_stats.is_rx_dup +
+                    ic->ic_stats.is_rx_notassoc +
+                    ic->ic_stats.is_rx_decryptcrc +
+                    ic->ic_stats.is_rx_eapol_badmic +
+                    ic->ic_stats.is_ccmp_dec_errs;
+    return kIOReturnSuccess;
+}
+
+IOReturn AirportItlwmSkywalkInterface::
+getRX_RATE(struct apple80211_rate_data *rd)
+{
+    /*
+     * The HAL does not track a per-packet RX rate; the firmware reports the
+     * negotiated set only. Return the same current-rate view as getRATE so
+     * networkQuality and wdutil have a consistent value instead of an error.
+     */
+    return getRATE(rd);
+}
+
+IOReturn AirportItlwmSkywalkInterface::
 getNOISE(struct apple80211_noise_data *nd)
 {
     struct ieee80211com *ic = fHalService->get80211Controller();
@@ -749,9 +863,68 @@ getNOISE(struct apple80211_noise_data *nd)
 IOReturn AirportItlwmSkywalkInterface::
 getPOWERSAVE(struct apple80211_powersave_data *pd)
 {
+    if (!pd)
+        return kIOReturnError;
     pd->version = APPLE80211_VERSION;
-    pd->powersave_level = APPLE80211_POWERSAVE_MODE_DISABLED;
+    pd->powersave_level = fHalService->getPowerSaveMode() ?
+        APPLE80211_POWERSAVE_MODE_80211 :
+        APPLE80211_POWERSAVE_MODE_DISABLED;
     return kIOReturnSuccess;
+}
+
+IOReturn AirportItlwmSkywalkInterface::
+setPOWERSAVE(struct apple80211_powersave_data *pd)
+{
+    if (!pd)
+        return kIOReturnBadArgument;
+    /*
+     * Unknown levels (WOW, vendor MIMO) are accepted without changing the
+     * hardware: failing a power-save request is treated as a config error by
+     * WCL and can take the link down with it.
+     */
+    if (pd->powersave_level > APPLE80211_POWERSAVE_MODE_MAX_POWERSAVE)
+        return kIOReturnSuccess;
+#ifdef AIRPORT_WCL
+    if (!_fCommandGate)
+        return kIOReturnNotReady;
+    return _fCommandGate->runAction(wclCommand, this,
+                                    reinterpret_cast<void *>(16), pd);
+#else
+    /* Any non-zero Apple level means "let the hardware doze". */
+    return fHalService->setPowerSaveMode(
+        pd->powersave_level != APPLE80211_POWERSAVE_MODE_DISABLED ? 1 : 0);
+#endif
+}
+
+IOReturn AirportItlwmSkywalkInterface::
+setPM_MODE(apple80211_pm_mode *pm)
+{
+    if (!pm)
+        return kIOReturnBadArgument;
+    /*
+     * apple80211_pm_mode is opaque in the public IO80211 headers. Like every
+     * Apple 80211 request it begins with a 32-bit version, and the mode
+     * follows it. Read the field defensively: an unexpected layout yields a
+     * value outside the powersave range and is accepted without touching the
+     * hardware, so a wrong guess can never disable a working link.
+     */
+    u_int32_t mode = 0;
+    memcpy(&mode, reinterpret_cast<const u_int8_t *>(pm) + sizeof(u_int32_t),
+           sizeof(mode));
+    if (mode > APPLE80211_POWERSAVE_MODE_MAX_POWERSAVE)
+        return kIOReturnSuccess;
+#ifdef AIRPORT_WCL
+    if (!_fCommandGate)
+        return kIOReturnNotReady;
+    return _fCommandGate->runAction(
+        wclCommand, this,
+        reinterpret_cast<void *>(17),
+        reinterpret_cast<void *>(static_cast<uintptr_t>(
+            mode != APPLE80211_POWERSAVE_MODE_DISABLED)));
+#else
+    return fHalService->setPowerSaveMode(
+        mode != APPLE80211_POWERSAVE_MODE_DISABLED ? 1 : 0);
+#endif
 }
 
 IOReturn AirportItlwmSkywalkInterface::
@@ -863,11 +1036,24 @@ getSUPPORTED_CHANNELS(struct apple80211_sup_channel_data *ad)
 IOReturn AirportItlwmSkywalkInterface::
 getLOCALE(struct apple80211_locale_data *ld)
 {
+    char cc[3] = { 0, 0, 0 };
+    const char *fw_cc;
+
     if (!ld)
         return kIOReturnError;
+
+    /* Same precedence as getCOUNTRY_CODE: boot override, then firmware. */
+    PE_parse_boot_argn("itlwm_cc", cc, sizeof(cc));
+    if (!cc[0]) {
+        fw_cc = fHalService->getDriverInfo()->getFirmwareCountryCode();
+        if (fw_cc) {
+            cc[0] = fw_cc[0];
+            cc[1] = fw_cc[1];
+        }
+    }
+
     ld->version = APPLE80211_VERSION;
-    ld->locale  = APPLE80211_LOCALE_FCC;
-    
+    ld->locale  = appleLocaleForCountryCode(cc);
     return kIOReturnSuccess;
 }
 

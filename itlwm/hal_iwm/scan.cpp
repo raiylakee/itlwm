@@ -1018,6 +1018,37 @@ iwm_bgscan(struct ieee80211com *ic)
     return 0;
 }
 
+/*
+ * Roam trigger. net80211 calls this for every beacon while running; a
+ * non-zero return means the link is still good, zero arms the background
+ * scan that may eventually switch to a better BSS.
+ *
+ * iwm's RX path normalises the firmware dBm value into ni_rssi with
+ * "0 - IWM_MIN_DBM + rssi" (rx.cpp), so the signed dBm value is
+ * ni_rssi + IWM_MIN_DBM. OpenBSD's default trigger is -60 dBm on 2 GHz
+ * and -70 dBm on 5 GHz; keep their semantics but make the thresholds
+ * tunable with itlwm_rssi_2g / itlwm_rssi_5g.
+ */
+int ItlIwm::
+iwm_node_checkrssi(struct ieee80211com *ic, const struct ieee80211_node *ni)
+{
+    struct iwm_softc *sc = (struct iwm_softc *)ic->ic_softc;
+    int thres;
+    int rssi;
+
+    if (ni == NULL || ni->ni_chan == IEEE80211_CHAN_ANYC)
+        return 0;
+
+    rssi = (int)ni->ni_rssi + IWM_MIN_DBM;    /* normalised -> dBm */
+
+    if (IEEE80211_IS_CHAN_2GHZ(ni->ni_chan))
+        thres = sc->sc_rssi_thres_2g;
+    else
+        thres = sc->sc_rssi_thres_5g;
+
+    return rssi >= thres;
+}
+
 int ItlIwm::
 iwm_umac_scan_abort(struct iwm_softc *sc)
 {

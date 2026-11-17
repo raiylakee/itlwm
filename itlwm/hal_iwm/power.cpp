@@ -181,8 +181,50 @@ iwm_power_build_cmd(struct iwm_softc *sc, struct iwm_node *in,
     keep_alive = roundup(keep_alive, 1000) / 1000;
     cmd->keep_alive_seconds = htole16(keep_alive);
     
-    if (ic->ic_opmode != IEEE80211_M_MONITOR)
+    if (ic->ic_opmode != IEEE80211_M_MONITOR) {
         cmd->flags = htole16(IWM_POWER_FLAGS_POWER_SAVE_ENA_MSK);
+        /*
+         * POWER_SAVE_ENA alone does not let the firmware doze: without
+         * POWER_MANAGEMENT_ENA the MAC stays awake between DTIMs. This is
+         * the bit iwlwifi sets for IWL_POWER_ENABLED, and the reason
+         * beacon abort was always disabled here (it was derived from this
+         * same flags field below).
+         */
+        if (sc->sc_pwrsave_mode) {
+            cmd->flags |= htole16(IWM_POWER_FLAGS_POWER_MANAGEMENT_ENA_MSK);
+            /*
+             * Linux's default PS timeouts: stay awake for 100 ms after the
+             * last Rx/Tx before letting the firmware doze. Zero would also
+             * work but makes the MAC enter PS after every single frame,
+             * which costs latency for no measurable gain.
+             */
+            cmd->rx_data_timeout = htole32(100 * 1000);
+            cmd->tx_data_timeout = htole32(100 * 1000);
+        }
+    }
+}
+
+int ItlIwm::
+iwm_power_set_mode(struct iwm_softc *sc, int enable)
+{
+    struct ieee80211com *ic = &sc->sc_ic;
+
+    if (sc->sc_pwrsave_disabled)
+        enable = 0;
+    if (sc->sc_pwrsave_mode == enable)
+        return 0;
+    sc->sc_pwrsave_mode = enable;
+
+    /*
+     * Only a running association has a MAC context and DTIM period to
+     * program. Elsewhere the next iwm_power_mac_update_mode() at
+     * association (mac80211.cpp) picks the new state up.
+     */
+    if (ic->ic_state != IEEE80211_S_RUN || ic->ic_bss == NULL ||
+        (sc->sc_flags & IWM_FLAG_SCANNING))
+        return 0;
+
+    return iwm_power_mac_update_mode(sc, (struct iwm_node *)ic->ic_bss);
 }
 
 int ItlIwm::
@@ -218,6 +260,20 @@ iwm_power_update_device(struct iwm_softc *sc)
     
     return iwm_send_cmd_pdu(sc,
                             IWM_POWER_TABLE_CMD, 0, sizeof(cmd), &cmd);
+}
+
+IOReturn ItlIwm::
+setPowerSaveMode(uint32_t mode)
+{
+    XYLog("%s mode=%u\n", __FUNCTION__, mode);
+    return iwm_power_set_mode(&com, mode ? 1 : 0) == 0 ?
+           kIOReturnSuccess : kIOReturnError;
+}
+
+uint32_t ItlIwm::
+getPowerSaveMode()
+{
+    return com.sc_pwrsave_mode ? 1 : 0;
 }
 
 int ItlIwm::
