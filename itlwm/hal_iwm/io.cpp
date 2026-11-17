@@ -204,15 +204,27 @@ iwm_write_mem32(struct iwm_softc *sc, uint32_t addr, uint32_t val)
     return iwm_write_mem(sc, addr, &val, 1);
 }
 
+/*
+ * A register that reads as all ones means the device is not answering on
+ * the bus. That can happen briefly while the PCIe link comes back after
+ * resume, so an all-ones read never counts as success but polling goes on
+ * until the caller's timeout.
+ */
 int ItlIwm::
 iwm_poll_bit(struct iwm_softc *sc, int reg, uint32_t bits, uint32_t mask,
     int timo)
 {
+    uint32_t val;
+
     for (;;) {
-        if ((IWM_READ(sc, reg) & mask) == (bits & mask)) {
+        val = IWM_READ(sc, reg);
+        if (val != 0xffffffff && (val & mask) == (bits & mask)) {
             return 1;
         }
         if (timo < 10) {
+            if (val == 0xffffffff)
+                XYLog("%s: device not responding (reg 0x%x reads 0xffffffff)\n",
+                      DEVNAME(sc), reg);
             return 0;
         }
         timo -= 10;
