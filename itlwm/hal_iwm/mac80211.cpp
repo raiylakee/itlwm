@@ -896,6 +896,15 @@ iwm_rx_hwdecrypt(struct iwm_softc *sc, mbuf_t m, uint32_t rx_pkt_status,
     if (ieee80211_has_qos(wh) && (subtype & IEEE80211_FC0_SUBTYPE_NODATA))
         return 0;
     
+    /*
+     * AP: keys are kept in net80211 only (see iwm_set_key()), so firmware
+     * never reports a successful decryption for a client's frames.  Leave
+     * rxi_flags alone and let net80211 decrypt in software; dropping here
+     * would take every associated station's traffic down with it.
+     */
+    if (ic->ic_opmode == IEEE80211_M_HOSTAP)
+        return 0;
+    
     if (IEEE80211_IS_MULTICAST(wh->i_addr1) ||
         !(wh->i_fc[1] & IEEE80211_FC1_PROTECTED))
         return 0;
@@ -1657,6 +1666,17 @@ iwm_tx_fill_cmd(struct iwm_softc *sc, struct iwm_node *in,
             ridx = sc->sc_fixed_ridx;
     } else if (ic->ic_fixed_rate != -1) {
         ridx = sc->sc_fixed_ridx;
+     } else if (ic->ic_opmode == IEEE80211_M_HOSTAP) {
+        /*
+         * AP: associated clients never get a rate-scaling (LQ) command from
+         * us, so firmware has no per-station retry table to consult for
+         * them.  Spell the rate out instead of raising
+         * IWM_TX_CMD_FLG_STA_RATE, which would make firmware walk an
+         * uninitialised table.
+         */
+        ridx = ni->ni_txrate ? iwm_rate2ridx(sc, ni->ni_txrate) :
+            iwm_rate2ridx(sc, ieee80211_max_basic_rate(ic));
+        tx->data_retry_limit = IWM_DEFAULT_TX_RETRY;
      } else {
         /* Use firmware rateset retry table. */
         tx->initial_rate_index = 0;
@@ -1851,7 +1871,33 @@ iwm_tx(struct iwm_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)
         flags |= (IWM_TX_CMD_FLG_ACK | IWM_TX_CMD_FLG_BAR);
     }
     
-    tx->sta_id = IWM_STATION_ID;
+    /*
+     * Pick the firmware station this frame belongs to.
+     *
+     * As an AP our own BSS node has no firmware entry: beacons and probe
+     * responses are generated against the broadcast (general purpose)
+     * station, group-addressed data against the multicast station, and
+     * unicast data against the client's own station -- falling back to the
+     * broadcast station when the client has none (yet).
+     */
+    if (ic->ic_opmode == IEEE80211_M_MONITOR)
+        tx->sta_id = IWM_MONITOR_STA_ID;
+    else if (ic->ic_opmode == IEEE80211_M_HOSTAP) {
+        if (type != IEEE80211_FC0_TYPE_DATA)
+            tx->sta_id = sc->sc_bcast_sta_id;
+        else if (IEEE80211_IS_MULTICAST(wh->i_addr1))
+            tx->sta_id = sc->sc_mcast_sta_id;
+        else if (in->in_sta_added && in->in_sta_id != IWM_STATION_ID)
+            tx->sta_id = in->in_sta_id;
+        else
+            tx->sta_id = sc->sc_bcast_sta_id;
+    } else {
+        /*
+         * The BSS node (in_sta_id 0) is the general-purpose station firmware
+         * uses for beacons, probe responses and group-addressed frames.
+         */
+        tx->sta_id = in->in_sta_id;
+    }
     
     if (type == IEEE80211_FC0_TYPE_MGT) {
         if (subtype == IEEE80211_FC0_SUBTYPE_ASSOC_REQ ||
@@ -2019,7 +2065,11 @@ iwm_update_sched(struct iwm_softc *sc, int qid, int cur, uint8_t sta_id, uint16_
     }
 
     len = howmany(len, 4);
-    bc_ent = htole16(len | (IWM_STATION_ID << 12));
+    /*
+     * Bits 12..15 of the byte-count entry carry the station the frame is
+     * destined for; in AP mode that is rarely our own station 0.
+     */
+    bc_ent = htole16(len | ((sta_id & 0xf) << 12));
     scd_bc_tbl[qid].tfd_offset[cur] = bc_ent;
     if (cur < IWM_TFD_QUEUE_SIZE_BC_DUP) {
         scd_bc_tbl[qid].tfd_offset[IWM_TFD_QUEUE_SIZE_MAX + cur] = bc_ent;
@@ -2090,6 +2140,18 @@ iwm_mac_ctxt_cmd_common(struct iwm_softc *sc, struct iwm_node *in,
         cmd->mac_type = htole32(IWM_FW_MAC_TYPE_LISTENER);
     else if (ic->ic_opmode == IEEE80211_M_STA)
         cmd->mac_type = htole32(IWM_FW_MAC_TYPE_BSS_STA);
+    else if (ic->ic_opmode == IEEE80211_M_HOSTAP)
+        /*
+         * The firmware MAC-type enum has no dedicated AP entry: AP and
+         * P2P GO are the same firmware role (beacon-scheduling MAC that
+         * owns a BSS), which is why struct iwm_mac_data_go wraps
+         * struct iwm_mac_data_ap.  We fill cmd->ap below; firmware reads
+         * it as the leading member of iwm_mac_data_go with ctwin and
+         * opp_ps_enabled left at zero.
+         */
+        cmd->mac_type = htole32(IWM_FW_MAC_TYPE_GO);
+    else if (ic->ic_opmode == IEEE80211_M_IBSS)
+        cmd->mac_type = htole32(IWM_FW_MAC_TYPE_IBSS);
     else
         panic("unsupported operating mode %d\n", ic->ic_opmode);
     cmd->tsf_id = htole32(IWM_TSF_ID_A);
@@ -2187,6 +2249,52 @@ iwm_mac_ctxt_cmd_fill_sta(struct iwm_softc *sc, struct iwm_node *in,
     sta->assoc_beacon_arrive_time = htole32(ni->ni_rstamp);
 }
 
+/*
+ * Fill the mode-specific half of the MAC context command for AP operation.
+ * Firmware uses bi/bi_reciprocal to schedule TBTTs and dtim_interval to
+ * decide when to beacon DTIM 0 (and therefore when to flush buffered
+ * group-addressed traffic).  beacon_template must equal the id/color of this
+ * MAC context: that is the template id BEACON_TEMPLATE_CMD registers under.
+ *
+ * beacon_time is only sampled while "add" is set: refreshing it on every
+ * MODIFY would make firmware's TBTT jump, exactly as in
+ * iwl_mvm_mac_ctxt_cmd_fill_ap().
+ */
+void ItlIwm::
+iwm_mac_ctxt_cmd_fill_ap(struct iwm_softc *sc, struct iwm_node *in,
+                         struct iwm_mac_data_ap *ap, int add)
+{
+    struct ieee80211com *ic = &sc->sc_ic;
+    struct ieee80211_node *ni = &in->in_ni;
+    uint32_t bi = ni->ni_intval ? ni->ni_intval : ic->ic_lintval;
+    uint32_t dtim_period = ni->ni_dtimperiod ? ni->ni_dtimperiod : 1;
+    uint32_t dtim;
+
+    if (bi == 0)
+        bi = 100;               /* 100 TU is the 802.11 default beacon int */
+    dtim = bi * dtim_period;
+
+    if (add && sc->sc_ap_beacon_time == 0) {
+        /* iwm_read_prph() asserts the NIC lock, which is a counter. */
+        iwm_nic_lock(sc);
+        sc->sc_ap_beacon_time =
+            iwm_read_prph(sc, IWM_DEVICE_SYSTEM_TIME_REG);
+        iwm_nic_unlock(sc);
+        XYLog("%s: AP beacon time (GP2) = %u\n", DEVNAME(sc),
+              sc->sc_ap_beacon_time);
+    }
+
+    memset(ap, 0, sizeof(*ap));
+    ap->beacon_time = htole32(sc->sc_ap_beacon_time);
+    ap->beacon_tsf = htole64(0);        /* unused */
+    ap->bi = htole32(bi);
+    ap->bi_reciprocal = htole32(iwm_reciprocal(bi));
+    ap->dtim_interval = htole32(dtim);
+    ap->dtim_reciprocal = htole32(iwm_reciprocal(dtim));
+    ap->mcast_qid = htole32(IWM_DQA_GCAST_QUEUE);
+    ap->beacon_template = htole32(in->in_id);
+}
+
 int ItlIwm::
 iwm_mac_ctxt_cmd(struct iwm_softc *sc, struct iwm_node *in, uint32_t action,
                  int assoc)
@@ -2216,6 +2324,16 @@ iwm_mac_ctxt_cmd(struct iwm_softc *sc, struct iwm_node *in, uint32_t action,
                                     IWM_MAC_FILTER_IN_BEACON |
                                     IWM_MAC_FILTER_IN_PROBE_REQUEST |
                                     IWM_MAC_FILTER_IN_CRC32);
+    } else if (ic->ic_opmode == IEEE80211_M_HOSTAP) {
+        /*
+         * AP: the host runs the 802.11 MLME (probe request, authentication,
+         * association), so probe requests have to reach us.  Beacons are not
+         * received -- firmware transmits them from the template registered
+         * by iwm_beacon_update().
+         */
+        cmd.filter_flags |= htole32(IWM_MAC_FILTER_IN_PROBE_REQUEST);
+        iwm_mac_ctxt_cmd_fill_ap(sc, in, &cmd.ap,
+                                 action == IWM_FW_CTXT_ACTION_ADD);
     } else if (!assoc || !ni->ni_associd || !ni->ni_dtimperiod)
     /*
      * Allow beacons to pass through as long as we are not
@@ -2226,6 +2344,99 @@ iwm_mac_ctxt_cmd(struct iwm_softc *sc, struct iwm_node *in, uint32_t action,
         iwm_mac_ctxt_cmd_fill_sta(sc, in, &cmd.sta, assoc);
     
     return iwm_send_cmd_pdu(sc, IWM_MAC_CONTEXT_CMD, 0, sizeof(cmd), &cmd);
+}
+
+/*
+ * Register a freshly built beacon frame with firmware.
+ *
+ * The images that drive the AC 8260 (iwlwifi-8000C-36) advertise
+ * IWM_UCODE_TLV_CAPA_CSA_AND_TBTT_OFFLOAD together with
+ * IWM_UCODE_TLV_API_NEW_BEACON_TEMPLATE, which is exactly the combination
+ * that makes iwl_mvm_mac_ctxt_send_beacon() pick
+ * BEACON_TEMPLATE_CMD_API_S_VER_10: a 32-byte header followed by the beacon
+ * frame.  Both halves travel in one host command -- the frame is the second
+ * fragment -- mirroring Linux's IWL_HCMD_DFL_DUP path.
+ */
+int ItlIwm::
+iwm_beacon_update(struct iwm_softc *sc, struct iwm_node *in)
+{
+    struct ieee80211com *ic = &sc->sc_ic;
+    struct ieee80211_node *ni = &in->in_ni;
+    struct iwm_mac_beacon_cmd_v10 cmd;
+    struct iwm_host_cmd hcmd;
+    mbuf_t m;
+    uint8_t *frm, *end, *ie;
+    uint32_t tim_idx = 0, tim_size = 0;
+    uint32_t framelen;
+    int ridx, err;
+
+    m = ieee80211_beacon_alloc(ic, ni);
+    if (m == NULL) {
+        XYLog("%s: could not build beacon frame\n", DEVNAME(sc));
+        return ENOMEM;
+    }
+    if (mbuf_next(m) != NULL) {
+        XYLog("%s: beacon frame came back chained\n", DEVNAME(sc));
+        mbuf_freem(m);
+        return ENOBUFS;
+    }
+
+    frm = mtod(m, uint8_t *);
+    end = frm + mbuf_len(m);
+    framelen = (uint32_t)mbuf_len(m);
+
+    /*
+     * Walk the IEs to locate TIM.  Offsets are relative to the very first
+     * byte of the frame, which is what firmware expects.
+     */
+    for (ie = frm + sizeof(struct ieee80211_frame) + 8 + 2 + 2;
+         ie + 2 <= end && ie + 2 + ie[1] <= end;
+         ie += 2 + ie[1]) {
+        if (ie[0] == IEEE80211_ELEMID_TIM) {
+            tim_idx = (uint32_t)(ie - frm);
+            tim_size = ie[1];
+        }
+    }
+    if (tim_size == 0)
+        XYLog("%s: warning: beacon carries no TIM\n", DEVNAME(sc));
+
+    /*
+     * Beacon at the lowest basic rate of the operating channel, exactly like
+     * iwl_mvm_mac_ctxt_send_beacon_v9(): PLCP code in the low byte, the
+     * iwl_mac_beacon_flags in the high byte.
+     */
+    ridx = (ni->ni_chan != NULL && IEEE80211_IS_CHAN_2GHZ(ni->ni_chan)) ?
+        IWL_FIRST_CCK_RATE : IWL_FIRST_OFDM_RATE;
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.byte_cnt = htole16((uint16_t)framelen);
+    cmd.flags = htole16((uint16_t)iwl_mvm_mac80211_idx_to_hwrate(ridx));
+    if (ridx <= IWL_LAST_CCK_RATE)
+        cmd.flags = htole16(le16toh(cmd.flags) | IWM_MAC_BEACON_CCK_V1);
+    cmd.template_id = htole32(in->in_id);
+    cmd.tim_idx = htole32(tim_idx);
+    cmd.tim_size = htole32(tim_size);
+    /* net80211 emits no CSA/ECSA here; firmware treats 0 as "absent". */
+    cmd.ecsa_offset = htole32(0);
+    cmd.csa_offset = htole32(0);
+
+    memset(&hcmd, 0, sizeof(hcmd));
+    hcmd.id = IWM_BEACON_TEMPLATE_CMD;
+    hcmd.len[0] = sizeof(cmd);
+    hcmd.data[0] = &cmd;
+    hcmd.len[1] = (uint16_t)framelen;
+    hcmd.data[1] = frm;
+
+    err = iwm_send_cmd(sc, &hcmd);
+    mbuf_freem(m);
+    if (err != 0) {
+        XYLog("%s: could not send beacon template (error %d)\n",
+              DEVNAME(sc), err);
+        return err;
+    }
+    XYLog("%s: beacon template installed, %u bytes, TIM idx=%u size=%u\n",
+          DEVNAME(sc), framelen, tim_idx, tim_size);
+    return 0;
 }
 
 int ItlIwm::
@@ -2337,6 +2548,17 @@ iwm_auth(struct iwm_softc *sc)
     in->in_phyctxt = &sc->sc_phyctxt[0];
     IEEE80211_ADDR_COPY(in->in_macaddr, in->in_ni.ni_macaddr);
     
+    if (ic->ic_opmode == IEEE80211_M_HOSTAP) {
+        /*
+         * Family 22000 and older expect the beacon template to be in place
+         * before the MAC context exists, because the template is registered
+         * against the MAC id.  (Newer families do it the other way round.)
+         */
+        err = iwm_beacon_update(sc, in);
+        if (err != 0)
+            return err;
+    }
+    
     err = iwm_mac_ctxt_cmd(sc, in, IWM_FW_CTXT_ACTION_ADD, 0);
     if (err) {
         XYLog("%s: could not add MAC context (error %d)\n",
@@ -2352,6 +2574,29 @@ iwm_auth(struct iwm_softc *sc)
         goto rm_mac_ctxt;
     }
     sc->sc_flags |= IWM_FLAG_BINDING_ACTIVE;
+    
+    if (ic->ic_opmode == IEEE80211_M_HOSTAP) {
+        /*
+         * As an AP we deliberately do not create firmware station 0 for our
+         * own BSS node: beacons and probe responses go out on the broadcast
+         * station, group-addressed traffic on the multicast one, and every
+         * associated client gets its own station from iwm_newassoc().
+         */
+        err = iwm_add_ap_stas(sc, in);
+        if (err) {
+            XYLog("%s: could not add AP stations (error %d)\n",
+                  DEVNAME(sc), err);
+            goto rm_binding;
+        }
+        
+        iwm_toggle_tx_ant(sc, &sc->sc_tx_ant);
+        
+        rs_drv_alloc_sta(sc, &in->in_ni);
+        iwl_mvm_rs_rate_init(sc, ic->ic_bss,
+                             IEEE80211_IS_CHAN_2GHZ(ic->ic_bss->ni_chan) ?
+                             NL80211_BAND_2GHZ : NL80211_BAND_5GHZ, false);
+        return 0;
+    }
     
     err = iwm_add_sta_cmd(sc, in, 0, 0);
     if (err) {
@@ -2406,7 +2651,27 @@ iwm_deauth(struct iwm_softc *sc)
     
     splassert(IPL_NET);
     
-    iwm_unprotect_session(sc, in);
+    if (ic->ic_opmode == IEEE80211_M_HOSTAP) {
+        /*
+         * AP: there is no session to protect and no station 0 to remove.
+         * Drop the internal broadcast/multicast stations (and every client
+         * station) while the binding they belong to still exists, and forget
+         * the TBTT base so the next AP start samples a fresh one.
+         */
+        iwm_rm_ap_stas(sc);
+        sc->sc_ap_beacon_time = 0;
+        /*
+         * A station that is still associated when the interface is switched
+         * over to AP mode (Internet Sharing started while connected) owns a
+         * firmware time event; drop it or the AP start would inherit
+         * IWM_FLAG_TE_ACTIVE.  iwm_unprotect_session() is a no-op when no
+         * time event is outstanding.
+         */
+        if (sc->sc_flags & IWM_FLAG_STA_ACTIVE)
+            iwm_unprotect_session(sc, in);
+    } else {
+        iwm_unprotect_session(sc, in);
+    }
     
     if (sc->sc_flags & IWM_FLAG_STA_ACTIVE) {
         err = iwm_rm_sta_cmd(sc, in);
@@ -2430,6 +2695,11 @@ iwm_deauth(struct iwm_softc *sc)
         if (isset(sc->sc_enabled_capa, IWM_UCODE_TLV_CAPA_DQA_SUPPORT))
             qid += IWM_DQA_MIN_MGMT_QUEUE;
         tfd_queue_msk |= htole32(1 << qid);
+    }
+    if (ic->ic_opmode == IEEE80211_M_HOSTAP) {
+        /* The AP also owns the group-addressed and probe-response queues. */
+        tfd_queue_msk |= htole32(1 << IWM_DQA_GCAST_QUEUE);
+        tfd_queue_msk |= htole32(1 << IWM_DQA_AP_PROBE_RESP_QUEUE);
     }
     
     err = iwm_flush_tx_path(sc, tfd_queue_msk);
@@ -2488,8 +2758,13 @@ iwm_run(struct iwm_softc *sc)
     
     splassert(IPL_NET);
     
-    if (ic->ic_opmode == IEEE80211_M_MONITOR) {
-        /* Add a MAC context and a sniffing STA. */
+    if (ic->ic_opmode == IEEE80211_M_MONITOR ||
+        ic->ic_opmode == IEEE80211_M_HOSTAP) {
+        /*
+         * MONITOR: add a MAC context and a sniffing STA.
+         * HOSTAP: install the beacon template, the MAC context, the binding
+         * and the internal broadcast/multicast stations.
+         */
         err = iwm_auth(sc);
         if (err)
             return err;
@@ -2526,12 +2801,14 @@ iwm_run(struct iwm_softc *sc)
     }
     
     /* Update STA again, for HT-related settings such as MIMO. */
-     err = iwm_add_sta_cmd(sc, in, 1, 0);
-     if (err) {
-         XYLog("%s: could not update STA (error %d)\n",
-             DEVNAME(sc), err);
-         return err;
-     }
+    if (ic->ic_opmode != IEEE80211_M_HOSTAP) {
+        err = iwm_add_sta_cmd(sc, in, 1, 0);
+        if (err) {
+            XYLog("%s: could not update STA (error %d)\n",
+                  DEVNAME(sc), err);
+            return err;
+        }
+    }
     
     /* We have now been assigned an associd by the AP. */
     err = iwm_mac_ctxt_cmd(sc, in, IWM_FW_CTXT_ACTION_MODIFY, 1);
@@ -2698,6 +2975,101 @@ iwm_node_alloc(struct ieee80211com *ic)
     return (struct ieee80211_node *)malloc(sizeof (struct iwm_node), M_DEVBUF, M_NOWAIT | M_ZERO);
 }
 
+/*
+ * net80211 calls this once a station has authenticated and associated.
+ * In AP mode it is where we hand the client a firmware station-table entry
+ * so that unicast traffic towards it can carry a real sta_id.
+ *
+ * Everything here is best-effort: the MAC context and the internal
+ * broadcast/multicast stations already exist, and iwm_tx() falls back to the
+ * broadcast station when in_sta_added is clear, so a failure here costs
+ * performance, not connectivity.
+ */
+void ItlIwm::
+iwm_newassoc(struct ieee80211com *ic, struct ieee80211_node *ni, int isnew)
+{
+    XYLog("%s: node=%s new=%d opmode=%d\n", __FUNCTION__,
+          ether_sprintf(ni->ni_macaddr), isnew, ic->ic_opmode);
+
+    if (ic->ic_opmode != IEEE80211_M_HOSTAP)
+        return;
+
+    struct iwm_softc *sc = (struct iwm_softc *)ic->ic_if.if_softc;
+    ItlIwm *that = container_of(sc, ItlIwm, com);
+    struct iwm_node *in = (struct iwm_node *)ni;
+    int sta_id;
+
+    if (in->in_sta_added)
+        return;
+
+    sta_id = that->iwm_alloc_ap_sta_id(sc);
+    if (sta_id < 0) {
+        XYLog("%s: no free firmware station id for %s, TX will use bcast\n",
+              DEVNAME(sc), ether_sprintf(ni->ni_macaddr));
+        return;
+    }
+
+    in->in_sta_id = (uint8_t)sta_id;
+    IEEE80211_ADDR_COPY(in->in_macaddr, ni->ni_macaddr);
+
+    if (that->iwm_add_sta_cmd(sc, in, 0, 0) != 0) {
+        XYLog("%s: could not add firmware station %d for %s\n", DEVNAME(sc),
+              sta_id, ether_sprintf(ni->ni_macaddr));
+        in->in_sta_added = 0;
+        in->in_sta_id = IWM_STATION_ID;
+        that->iwm_free_ap_sta_id(sc, sta_id);
+        return;
+    }
+
+    XYLog("%s: client %s -> firmware station %d\n", DEVNAME(sc),
+          ether_sprintf(ni->ni_macaddr), sta_id);
+
+    /*
+     * The AID is now in the TIM bitmap; re-push the beacon template so
+     * firmware advertises the buffered-data bit for this station.
+     */
+    if (ic->ic_state == IEEE80211_S_RUN)
+        (void)that->iwm_beacon_update(sc, (struct iwm_node *)ic->ic_bss);
+}
+
+/*
+ * net80211 calls this when a station disassociates or the node is reclaimed.
+ * Give the id back to the pool and refresh the TIM.
+ */
+void ItlIwm::
+iwm_node_leave(struct ieee80211com *ic, struct ieee80211_node *ni)
+{
+    XYLog("%s: node=%s opmode=%d\n", __FUNCTION__,
+          ether_sprintf(ni->ni_macaddr), ic->ic_opmode);
+
+    if (ic->ic_opmode != IEEE80211_M_HOSTAP)
+        return;
+
+    struct iwm_softc *sc = (struct iwm_softc *)ic->ic_if.if_softc;
+    ItlIwm *that = container_of(sc, ItlIwm, com);
+    struct iwm_node *in = (struct iwm_node *)ni;
+    struct iwm_rm_sta_cmd rm;
+    int sta_id = in->in_sta_id;
+
+    if (!in->in_sta_added || sta_id < IWM_AP_STA_ID_MIN) {
+        in->in_sta_id = IWM_STATION_ID;
+        return;
+    }
+
+    memset(&rm, 0, sizeof(rm));
+    rm.sta_id = (uint8_t)sta_id;
+    if (that->iwm_send_cmd_pdu(sc, IWM_REMOVE_STA, 0, sizeof(rm), &rm) != 0)
+        XYLog("%s: could not remove firmware station %d\n", DEVNAME(sc),
+              sta_id);
+
+    in->in_sta_added = 0;
+    in->in_sta_id = IWM_STATION_ID;
+    that->iwm_free_ap_sta_id(sc, sta_id);
+
+    if (ic->ic_state == IEEE80211_S_RUN)
+        (void)that->iwm_beacon_update(sc, (struct iwm_node *)ic->ic_bss);
+}
+
 int ItlIwm::
 iwm_set_key_v1(struct ieee80211com *ic, struct ieee80211_node *ni,
     struct ieee80211_key *k)
@@ -2729,6 +3101,20 @@ iwm_set_key(struct ieee80211com *ic, struct ieee80211_node *ni,
     struct iwm_softc *sc = (struct iwm_softc *)ic->ic_softc;
     struct iwm_add_sta_key_cmd cmd;
     ItlIwm *that = container_of(sc, ItlIwm, com);
+    
+    /*
+     * AP: keep every key in net80211 and let it decrypt in software.
+     *
+     * Transmit is unaffected -- iwm_tx() embeds the key in the Tx command
+     * itself -- but receive-side decryption needs a firmware station entry
+     * carrying the peer's key, and a client that has not been given one
+     * (or whose entry was reclaimed) would then be undecryptable.  Marking
+     * the key IEEE80211_KEY_SWCRYPTO makes ieee80211_decrypt() work for
+     * every station unconditionally, and iwm_rx_hwdecrypt() is told to stay
+     * out of the way in HOSTAP mode.
+     */
+    if (ic->ic_opmode == IEEE80211_M_HOSTAP)
+        return ieee80211_set_key(ic, ni, k);
     
     if ((k->k_flags & IEEE80211_KEY_GROUP) ||
         k->k_cipher != IEEE80211_CIPHER_CCMP)  {
@@ -2785,6 +3171,12 @@ iwm_delete_key(struct ieee80211com *ic, struct ieee80211_node *ni,
     struct iwm_softc *sc = (struct iwm_softc *)ic->ic_softc;
     struct iwm_add_sta_key_cmd cmd;
     ItlIwm *that = container_of(sc, ItlIwm, com);
+    
+    if (ic->ic_opmode == IEEE80211_M_HOSTAP) {
+        /* Paired with iwm_set_key(): the key only lives in net80211. */
+        ieee80211_delete_key(ic, ni, k);
+        return;
+    }
     
     if ((k->k_flags & IEEE80211_KEY_GROUP) ||
         (k->k_cipher != IEEE80211_CIPHER_CCMP)) {
@@ -3145,6 +3537,25 @@ iwm_newstate_task(void *psc)
             
         case IEEE80211_S_SCAN:
         next_scan:
+            if (ic->ic_opmode == IEEE80211_M_HOSTAP &&
+                ic->ic_des_chan != IEEE80211_CHAN_ANYC) {
+                /*
+                 * AP bring-up reaches the run state through net80211's
+                 * shared IBSS/hostap path: ieee80211_newstate() sees the
+                 * INIT -> SCAN transition, notes that an AP already has a
+                 * channel, and calls ieee80211_create_ibss() instead of
+                 * scanning -- that in turn finishes with IEEE80211_S_RUN.
+                 *
+                 * Kicking off a firmware scan here would move us off the
+                 * channel we are about to beacon on, and it is the
+                 * scan-complete handler that normally feeds the transition
+                 * back to net80211.  Do that hand-back directly.
+                 */
+                XYLog("%s: AP mode, not scanning (chan set)\n", DEVNAME(sc));
+                splx(s);
+                sc->sc_newstate(ic, nstate, arg);
+                return;
+            }
             err = that->iwm_scan(sc);
             if (err)
                 break;
@@ -3172,10 +3583,51 @@ out:
     }
 #endif
     if ((sc->sc_flags & IWM_FLAG_SHUTDOWN) == 0) {
-        if (err)
+        if (err) {
+            /* The transition failed; a latched AP request can never run. */
+            ic->ic_ap_start_pending = 0;
             task_add(systq, &sc->init_task);
-        else
+        } else {
             sc->sc_newstate(ic, nstate, arg);
+            /*
+             * Deferred AP (de)activation, see ic_ap_start_pending.
+             *
+             * startAPMode()/stopAPMode() latch the request and drive the
+             * interface to INIT; now that the INIT transition has drained we
+             * can either hand the link to net80211's shared ibss/hostap
+             * bring-up path (INIT -> SCAN -> ieee80211_create_ibss() -> RUN)
+             * or drop back to station mode.
+             */
+            if (ic->ic_ap_start_pending != 0 &&
+                ic->ic_state == IEEE80211_S_INIT) {
+                int pend = ic->ic_ap_start_pending;
+                ic->ic_ap_start_pending = 0;
+                if (pend == 1 && ic->ic_opmode == IEEE80211_M_HOSTAP) {
+                    XYLog("itlwm: AP start pending -> SCAN (chan %d)\n",
+                          ieee80211_chan2ieee(ic, ic->ic_des_chan));
+                    splx(s);
+                    sc->sc_newstate(ic, IEEE80211_S_SCAN, 0);
+                    return;
+                }
+                if (pend == 2) {
+                    XYLog("itlwm: AP stop pending -> STA\n");
+                    ic->ic_opmode = IEEE80211_M_STA;
+                    ic->ic_flags &= ~IEEE80211_F_IBSSON;
+                    ieee80211_reset_erp(ic);
+                    ic->ic_des_chan = IEEE80211_CHAN_ANYC;
+                    /*
+                     * The interface is still up: go back to scanning so the
+                     * user gets a working station again instead of a link
+                     * that is stuck in INIT.
+                     */
+                    if (IC2IFP(ic)->if_flags & IFF_UP) {
+                        splx(s);
+                        sc->sc_newstate(ic, IEEE80211_S_SCAN, 0);
+                        return;
+                    }
+                }
+            }
+        }
     }
     //        refcnt_rele_wake(&sc->task_refs);
     splx(s);
@@ -3196,8 +3648,14 @@ iwm_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
      * triggers another scan iteration. And AUTH -> AUTH is needed
      * to support band-steering.
      */
+    /*
+     * An AP bring-up/teardown latched in ic_ap_start_pending must not be
+     * swallowed by the same-state early-out: the interface is usually
+     * sitting in INIT already when airportd issues the AP ioctls, so a
+     * INIT -> INIT transition is exactly the request we care about.
+     */
     if (sc->ns_nstate == nstate && nstate != IEEE80211_S_SCAN &&
-        nstate != IEEE80211_S_AUTH)
+        nstate != IEEE80211_S_AUTH && ic->ic_ap_start_pending == 0)
         return 0;
     
     if (ic->ic_state == IEEE80211_S_RUN) {
@@ -3847,6 +4305,21 @@ iwm_stop(struct _ifnet *ifp)
     sc->sc_flags &= ~IWM_FLAG_TE_ACTIVE;
     sc->sc_flags &= ~IWM_FLAG_HW_ERR;
     sc->sc_flags &= ~IWM_FLAG_SHUTDOWN;
+
+    /*
+     * AP bookkeeping.  iwm_stop() never runs iwm_deauth(), and the firmware
+     * is gone by now anyway, so all that is left is to forget which station
+     * ids were in use and when the current TBTT base was sampled.
+     */
+    sc->sc_sta_id_mask = 0;
+    sc->sc_bcast_sta_id = 0;
+    sc->sc_mcast_sta_id = 0;
+    sc->sc_ap_beacon_time = 0;
+    sc->sc_beacon_notif_count = 0;
+    in->in_sta_id = IWM_STATION_ID;
+    in->in_sta_added = 0;
+    /* A pending AP (de)activation can never be honoured after a stop. */
+    ic->ic_ap_start_pending = 0;
 
     sc->sc_rx_ba_sessions = 0;
     sc->ba_rx.start_tidmask = 0;
@@ -5018,6 +5491,8 @@ iwm_attach(struct iwm_softc *sc, struct pci_attach_args *pa)
     IEEE80211_C_SCANALL |    /* device scans all channels at once */
     IEEE80211_C_SCANALLBAND |    /* device scans all bands at once */
     IEEE80211_C_MONITOR |    /* monitor mode supported */
+    IEEE80211_C_HOSTAP |     /* software AP (Internet Sharing / hotspot) */
+    IEEE80211_C_APPMGT |     /* AP-side PS: TIM bitmap + PS-Poll handling */
     IEEE80211_C_SHSLOT |    /* short slot time supported */
     IEEE80211_C_SHPREAMBLE;    /* short preamble supported */
     
@@ -5085,6 +5560,8 @@ iwm_attach(struct iwm_softc *sc, struct pci_attach_args *pa)
     task_set(&sc->chan_ctxt_task, iwm_chan_ctxt_task, sc, "chan_ctxt_task");
     
     ic->ic_node_alloc = iwm_node_alloc;
+    ic->ic_newassoc = iwm_newassoc;
+    ic->ic_node_leave = iwm_node_leave;
     ic->ic_bgscan_start = iwm_bgscan;
     /*
      * net80211 starts a background scan when a beacon arrives below these

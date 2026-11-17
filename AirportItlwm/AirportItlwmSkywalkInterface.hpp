@@ -288,19 +288,19 @@ public:
     virtual IOReturn getWCL_BGSCAN_CACHE_RESULT(apple80211_bgscan_cached_network_data_list *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getWIFI_NOISE_PER_ANT(apple80211_noise_per_ant_t *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getBLOCKED_BANDS(apple80211_blocked_bands *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-    virtual IOReturn setSSID(apple80211_ssid_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
+    virtual IOReturn setSSID(apple80211_ssid_data *) AIRPORT_SKYWALK_OVERRIDE;
     virtual IOReturn setAUTH_TYPE(apple80211_authtype_data *) AIRPORT_SKYWALK_OVERRIDE;
     virtual IOReturn setCIPHER_KEY(apple80211_key *) AIRPORT_SKYWALK_OVERRIDE;
-    virtual IOReturn setCHANNEL(apple80211_channel_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
+    virtual IOReturn setCHANNEL(apple80211_channel_data *) AIRPORT_SKYWALK_OVERRIDE;
     virtual IOReturn setPOWERSAVE(apple80211_powersave_data *) AIRPORT_SKYWALK_OVERRIDE;
     virtual IOReturn setTXPOWER(apple80211_txpower_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setRATE(apple80211_rate_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setSCAN_REQ(apple80211_scan_data *) AIRPORT_SKYWALK_OVERRIDE;
     virtual IOReturn setASSOCIATE(apple80211_assoc_data *) AIRPORT_SKYWALK_OVERRIDE;
     virtual IOReturn setDISASSOCIATE(apple80211_disassoc_data *) AIRPORT_SKYWALK_OVERRIDE;
-    virtual IOReturn setIBSS_MODE(apple80211_network_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-    virtual IOReturn setHOST_AP_MODE(apple80211_network_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-    virtual IOReturn setAP_MODE(apple80211_apmode_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
+    virtual IOReturn setIBSS_MODE(apple80211_network_data *) AIRPORT_SKYWALK_OVERRIDE;
+    virtual IOReturn setHOST_AP_MODE(apple80211_network_data *) AIRPORT_SKYWALK_OVERRIDE;
+    virtual IOReturn setAP_MODE(apple80211_apmode_data *) AIRPORT_SKYWALK_OVERRIDE;
     virtual IOReturn setDEAUTH(apple80211_deauth_data *) AIRPORT_SKYWALK_OVERRIDE;
     virtual IOReturn setTX_ANTENNA(void *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setANTENNA_DIVERSITY(void *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
@@ -313,10 +313,10 @@ public:
     virtual IOReturn setSTA_DISASSOCIATE(apple80211_sta_disassoc_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setSTA_DEAUTH(apple80211_sta_disassoc_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setRSN_CONF(apple80211_rsn_conf_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-    virtual IOReturn setIE(apple80211_ie_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
+    virtual IOReturn setIE(apple80211_ie_data *) AIRPORT_SKYWALK_OVERRIDE;
     virtual IOReturn setWOW_TEST(apple80211_wow_test_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setSCANCACHE_CLEAR(void *) AIRPORT_SKYWALK_OVERRIDE;
-    virtual IOReturn setVIRTUAL_IF_CREATE(apple80211_virt_if_create_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
+    virtual IOReturn setVIRTUAL_IF_CREATE(apple80211_virt_if_create_data *) AIRPORT_SKYWALK_OVERRIDE;
     virtual IOReturn setBT_COEX_FLAGS(apple80211_state_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setROAM(apple80211_sta_roam_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setHT_CAPABILITY(apple80211_ht_capability *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
@@ -511,7 +511,35 @@ private:
 private:
     AirportItlwm *instance;
     ItlHalService *fHalService;
-    
+
+    /*
+     * Software AP (Internet Sharing) support.
+     *
+     * airportd configures an AP by dribbling the ssid/channel/key over a
+     * handful of ioctls; startAPMode() latches the request into
+     * ic_ap_start_pending and lets the state machine finish the job.
+     */
+    IOReturn startAPMode(const uint8_t *ssid, uint32_t ssidLen,
+                         struct ieee80211_channel *chan);
+    IOReturn stopAPMode();
+    struct ieee80211_channel *lookupChannel(uint32_t channel);
+    void noteAPConfig(const char *what);
+    void maybeStartAP(const char *why);
+    bool apConfigured = false;
+    /*
+     * Only an explicit mode request (setAP_MODE/setIBSS_MODE/
+     * setHOST_AP_MODE) may flip the interface into AP mode.  setSSID and
+     * setCHANNEL are generic ioctls airportd also uses during an ordinary
+     * station join, so they only *record* configuration; without this gate a
+     * routine join could be mistaken for an AP start and tear down a working
+     * link.
+     */
+    bool apModeRequested = false;
+    /* SSID/channel handed over by airportd before it asks for the AP. */
+    uint8_t apSsid[APPLE80211_MAX_SSID_LEN] = {};
+    uint32_t apSsidLen = 0;
+    struct ieee80211_channel *apChan = nullptr;
+
     //IO80211
     struct ieee80211_node *fNextNodeToSend;
     IOTimerEventSource *scanSource;

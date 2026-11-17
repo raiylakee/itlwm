@@ -965,10 +965,15 @@ getCARD_CAPABILITIES(OSObject *object,
     // Disable not implemented capabilities
     // if (caps & IEEE80211_C_PMGT)
     //     cd->capabilities[0] |= 1 << APPLE80211_CAP_PMGT;
-    // if (caps & IEEE80211_C_IBSS)
-    //     cd->capabilities[0] |= 1 << APPLE80211_CAP_IBSS;
-    // if (caps & IEEE80211_C_HOSTAP)
-    //     cd->capabilities[0] |= 1 << APPLE80211_CAP_HOSTAP;
+    /*
+     * Software AP / ad-hoc.  Advertised so that Internet Sharing and the
+     * legacy (non-WCL) association path will actually offer the mode to
+     * the user instead of silently refusing it.
+     */
+    if (caps & IEEE80211_C_IBSS)
+        cd->capabilities[0] |= 1 << APPLE80211_CAP_IBSS;
+    if (caps & IEEE80211_C_HOSTAP)
+        cd->capabilities[0] |= 1 << APPLE80211_CAP_HOSTAP;
     // AES not enabled, like on Apple cards
 
     if (caps & IEEE80211_C_SHSLOT)
@@ -991,6 +996,13 @@ getCARD_CAPABILITIES(OSObject *object,
     // reject these networks before it submits an association request.
     cd->capabilities[0] = (caps & IEEE80211_C_RSN) ?
         (1 << APPLE80211_CAP_AES_CCM) | (1 << APPLE80211_CAP_TKIP) : 0;
+    /* This block overwrites capabilities[0] wholesale, so the software-AP
+     * bits have to be re-asserted here or Internet Sharing never offers
+     * the interface as an AP. */
+    if (caps & IEEE80211_C_IBSS)
+        cd->capabilities[0] |= 1 << APPLE80211_CAP_IBSS;
+    if (caps & IEEE80211_C_HOSTAP)
+        cd->capabilities[0] |= 1 << APPLE80211_CAP_HOSTAP;
     cd->capabilities[1] &= ~(1 << (APPLE80211_CAP_WPA1 - 8));
     cd->capabilities[5] = 0x40; // Scan completion events.
     cd->capabilities[2] = (1 << (APPLE80211_CAP_WME - 16)) |

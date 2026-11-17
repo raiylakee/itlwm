@@ -1091,6 +1091,24 @@ iwm_rx_pkt(struct iwm_softc *sc, struct iwm_rx_data *data, struct mbuf_list *ml)
                 iwm_rx_tx_ba_notif(sc, pkt, data);
                 break;
                 
+            case IWM_BEACON_NOTIFICATION: {
+                /*
+                 * AP mode: firmware tells us every time it put a beacon
+                 * from the template on the air.  Nothing to act on -- it is
+                 * the cheapest possible proof that the template registered
+                 * by iwm_beacon_update() is actually being transmitted.
+                 */
+                struct iwm_beacon_notif *notif;
+                SYNC_RESP_STRUCT(notif, pkt, struct iwm_beacon_notif *);
+                sc->sc_beacon_notif_count++;
+                if (sc->sc_beacon_notif_count <= 3 ||
+                    (sc->sc_beacon_notif_count % 100) == 0)
+                    XYLog("%s: beacon transmitted (count=%u, tsf=%llu)\n",
+                          DEVNAME(sc), sc->sc_beacon_notif_count,
+                          (unsigned long long)le64toh(notif->tsf));
+                break;
+            }
+                
             case IWM_MISSED_BEACONS_NOTIFICATION:
                 iwm_rx_bmiss(sc, pkt, data);
                 break;

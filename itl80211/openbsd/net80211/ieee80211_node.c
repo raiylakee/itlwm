@@ -959,8 +959,24 @@ ieee80211_create_ibss(struct ieee80211com* ic, struct ieee80211_channel *chan)
     ni->ni_rstamp = 0;
     memset(ni->ni_tstamp, 0, sizeof(ni->ni_tstamp));
     ni->ni_intval = ic->ic_lintval;
-    ni->ni_capinfo = IEEE80211_CAPINFO_IBSS;
-    if (ic->ic_flags & IEEE80211_F_WEPON)
+    /*
+     * NB: this function is the shared bring-up path for IBSS *and* hostap
+     * (see ieee80211_newstate()).  The BSS node's capability word must match
+     * the role we are actually playing, otherwise every frame we build from
+     * it advertises an ad-hoc BSS while we are beaconing as an ESS.
+     * Frames that carry capability info of their own (beacon, probe response,
+     * association response) go through ieee80211_add_capinfo(), which also
+     * keys off ic_opmode; this copy is what the node cache and the various
+     * join helpers read.
+     */
+    if (ic->ic_opmode == IEEE80211_M_HOSTAP)
+        ni->ni_capinfo = IEEE80211_CAPINFO_ESS;
+    else
+        ni->ni_capinfo = IEEE80211_CAPINFO_IBSS;
+    if (ic->ic_opmode == IEEE80211_M_HOSTAP &&
+        (ic->ic_flags & (IEEE80211_F_WEPON | IEEE80211_F_RSNON)))
+        ni->ni_capinfo |= IEEE80211_CAPINFO_PRIVACY;
+    else if (ic->ic_flags & IEEE80211_F_WEPON)
         ni->ni_capinfo |= IEEE80211_CAPINFO_PRIVACY;
     if (ic->ic_flags & IEEE80211_F_HTON) {
         const struct ieee80211_edca_ac_params *ac_qap;

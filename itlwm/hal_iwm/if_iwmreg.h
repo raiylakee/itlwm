@@ -4926,6 +4926,37 @@ struct iwm_mac_beacon_cmd {
     struct ieee80211_frame frame[0];
 } __packed;
 
+/*
+ * struct iwm_mac_beacon_cmd_v10 - beacon template command with offloaded CSA
+ * (BEACON_TEMPLATE_CMD_API_S_VER_10).
+ *
+ * Selected when the firmware advertises both
+ * IWM_UCODE_TLV_CAPA_CSA_AND_TBTT_OFFLOAD and
+ * IWM_UCODE_TLV_API_NEW_BEACON_TEMPLATE; the 8000C/8265 images that drive the
+ * AC 8260 do exactly that (see iwl_mvm_mac_ctxt_send_beacon()).
+ *
+ * The beacon frame itself is not part of this struct: it is appended to the
+ * same host command as a second fragment (iwm_send_cmd() concatenates
+ * hcmd->data[] into one payload, exactly like Linux's IWL_HCMD_DFL_DUP path).
+ */
+struct iwm_mac_beacon_cmd_v10 {
+    uint16_t byte_cnt;      /* length of the beacon frame that follows */
+    uint16_t flags;         /* low byte: PLCP rate, high byte: flags below */
+    uint32_t short_ssid;    /* FILS only; 0 when unused */
+    uint32_t reserved;
+    uint32_t template_id;   /* MAC context id the template belongs to */
+    uint32_t tim_idx;       /* offset of the TIM IE inside the frame */
+    uint32_t tim_size;      /* length byte of the TIM IE */
+    uint32_t ecsa_offset;   /* offset of the ECSA IE, 0 if absent */
+    uint32_t csa_offset;    /* offset of the CSA IE, 0 if absent */
+    uint8_t frame[0];
+} __packed;
+
+#define IWM_MAC_BEACON_CCK_V1      (1 << 8)
+#define IWM_MAC_BEACON_ANT_A_V1    (1 << 9)
+#define IWM_MAC_BEACON_ANT_B_V1    (1 << 10)
+#define IWM_MAC_BEACON_FILS_V1     (1 << 12)
+
 struct iwm_beacon_notif {
     struct iwm_tx_resp beacon_notify_hdr;
     uint64_t tsf;

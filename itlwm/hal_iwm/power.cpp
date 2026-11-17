@@ -321,7 +321,17 @@ iwm_add_sta_cmd(struct iwm_softc *sc, struct iwm_node *in, int update, unsigned 
     uint32_t max_aggsize = (IWM_STA_FLG_MAX_AGG_SIZE_4M >> IWM_STA_FLG_MAX_AGG_SIZE_SHIFT);
     struct ieee80211com *ic = &sc->sc_ic;
     
-    if (!update && (sc->sc_flags & IWM_FLAG_STA_ACTIVE)) {
+    /*
+     * IWM_FLAG_STA_ACTIVE tracks the BSS entry (index 0) only; associated
+     * clients carry their own index and their own in_sta_added bit, so adding
+     * or removing one must not disturb the bookkeeping for the other.
+     */
+    if (!update && in->in_sta_added) {
+        XYLog("sta %d already added\n", in->in_sta_id);
+        return 0;
+    }
+    if (!update && in->in_sta_id == IWM_STATION_ID &&
+        (sc->sc_flags & IWM_FLAG_STA_ACTIVE)) {
         XYLog("STA already added\n");
         return 0;
     }
@@ -331,9 +341,19 @@ iwm_add_sta_cmd(struct iwm_softc *sc, struct iwm_node *in, int update, unsigned 
     if (ic->ic_opmode == IEEE80211_M_MONITOR)
         add_sta_cmd.sta_id = IWM_MONITOR_STA_ID;
     else
-        add_sta_cmd.sta_id = IWM_STATION_ID;
+        add_sta_cmd.sta_id = in->in_sta_id;
     if (isset(sc->sc_ucode_api, IWM_UCODE_TLV_API_STA_TYPE)) {
         if (ic->ic_opmode == IEEE80211_M_MONITOR)
+            add_sta_cmd.station_type = IWM_STA_GENERAL_PURPOSE;
+        else if (ic->ic_opmode == IEEE80211_M_HOSTAP &&
+                 in->in_sta_id == IWM_STATION_ID)
+            /*
+             * Our own entry while operating as an AP.  REPLY_ADD_STA
+             * documents IWM_STA_GENERAL_PURPOSE as "in AP mode used for
+             * beacons and probe responses", which is exactly the role this
+             * node plays: firmware schedules the beacon template against it
+             * and it is the destination node for group-addressed traffic.
+             */
             add_sta_cmd.station_type = IWM_STA_GENERAL_PURPOSE;
         else
             add_sta_cmd.station_type = IWM_STA_LINK;
@@ -440,9 +460,13 @@ iwm_add_sta_cmd(struct iwm_softc *sc, struct iwm_node *in, int update, unsigned 
                                   &add_sta_cmd, &status);
     if (!err && (status & IWM_ADD_STA_STATUS_MASK) != IWM_ADD_STA_SUCCESS) {
         err = EIO;
-        XYLog("%s failed\n", __FUNCTION__);
-    } else
-        sc->sc_flags |= IWM_FLAG_STA_ACTIVE;
+        XYLog("%s failed sta_id=%d status=0x%x\n", __FUNCTION__,
+              add_sta_cmd.sta_id, status);
+    } else {
+        in->in_sta_added = 1;
+        if (in->in_sta_id == IWM_STATION_ID)
+            sc->sc_flags |= IWM_FLAG_STA_ACTIVE;
+    }
 
     return err;
 }
@@ -489,6 +513,237 @@ iwm_add_aux_sta(struct iwm_softc *sc)
     return err;
 }
 
+/*
+ * Station-id bookkeeping for AP mode.
+ *
+ * 0 is the BSS station, 1 is AUX and 2 is MONITOR, so every AP station --
+ * the two internal ones plus one per associated client -- is handed out of
+ * the 3..15 range tracked by sc_sta_id_mask.  Bit N of the mask means
+ * station id N is taken.
+ */
+int ItlIwm::
+iwm_alloc_ap_sta_id(struct iwm_softc *sc)
+{
+    int i;
+
+    for (i = IWM_AP_STA_ID_MIN; i <= IWM_AP_STA_ID_MAX; i++) {
+        if ((sc->sc_sta_id_mask & (1 << i)) == 0) {
+            sc->sc_sta_id_mask |= (1 << i);
+            return i;
+        }
+    }
+    return -1;
+}
+
+void ItlIwm::
+iwm_free_ap_sta_id(struct iwm_softc *sc, int sta_id)
+{
+    if (sta_id >= IWM_AP_STA_ID_MIN && sta_id <= IWM_AP_STA_ID_MAX)
+        sc->sc_sta_id_mask &= ~(1 << sta_id);
+}
+
+/*
+ * Add a station-table entry that is not backed by an ieee80211_node: the
+ * internal broadcast/multicast stations of an AP.  Mirrors Linux's
+ * iwl_mvm_add_int_sta_common().
+ *
+ * tfd_queue_msk is the set of Tx queues the scheduler should associate with
+ * the station; it is only meaningful on the old (SCD) Tx API, which is what
+ * the 8000C family uses.
+ */
+int ItlIwm::
+iwm_add_int_sta(struct iwm_softc *sc, uint8_t sta_id, const uint8_t *addr,
+                uint8_t type, uint32_t tfd_queue_msk)
+{
+    struct ieee80211com *ic = &sc->sc_ic;
+    struct iwm_node *bin = (struct iwm_node *)ic->ic_bss;
+    struct iwm_add_sta_cmd cmd;
+    uint32_t status;
+    size_t cmdsize;
+    int err;
+
+    XYLog("%s: sta_id=%d type=%d msk=0x%x\n", DEVNAME(sc), sta_id, type,
+          tfd_queue_msk);
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.sta_id = sta_id;
+    cmd.add_modify = 0;            /* 0 = add a new station */
+    cmd.mac_id_n_color =
+        htole32(IWM_FW_CMD_ID_AND_COLOR(bin->in_id, bin->in_color));
+    if (isset(sc->sc_ucode_api, IWM_UCODE_TLV_API_STA_TYPE))
+        cmd.station_type = type;
+    cmd.tfd_queue_msk = htole32(tfd_queue_msk);
+    cmd.tid_disable_tx = htole16(0xffff);
+    memcpy(cmd.addr, addr, ETHER_ADDR_LEN);
+
+    status = IWM_ADD_STA_SUCCESS;
+    if (isset(sc->sc_ucode_api, IWM_UCODE_TLV_API_STA_TYPE))
+        cmdsize = sizeof(cmd);
+    else
+        cmdsize = sizeof(struct iwm_add_sta_cmd_v7);
+    err = iwm_send_cmd_pdu_status(sc, IWM_ADD_STA, cmdsize, &cmd, &status);
+    if (err) {
+        XYLog("%s: could not add internal station %d (error %d)\n",
+              DEVNAME(sc), sta_id, err);
+        return err;
+    }
+    if ((status & IWM_ADD_STA_STATUS_MASK) != IWM_ADD_STA_SUCCESS) {
+        XYLog("%s: add internal station %d failed, status=0x%x\n",
+              DEVNAME(sc), sta_id, status);
+        return EIO;
+    }
+    return 0;
+}
+
+/*
+ * Bring up the two internal stations an AP needs.
+ *
+ * Linux adds the multicast station first and the broadcast one second
+ * (iwl_mvm_start_ap_ibss_common()), and -- because this is the old Tx API --
+ * enables each station's Tx queue *before* the ADD_STA that claims it.
+ *
+ * The four management queues (5..8) are bound to station 0 by iwm_init_hw(),
+ * but station 0 never exists in AP mode, so they are handed to the broadcast
+ * station here; unicast client traffic still carries the client's own id in
+ * every Tx command and byte-count entry.
+ */
+int ItlIwm::
+iwm_add_ap_stas(struct iwm_softc *sc, struct iwm_node *in)
+{
+    static const uint8_t mcast_addr[ETHER_ADDR_LEN] =
+        { 0x03, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    static const uint8_t bcast_addr[ETHER_ADDR_LEN] =
+        { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+    int mcast_id, bcast_id, err, qid, ac;
+
+    if (!isset(sc->sc_enabled_capa, IWM_UCODE_TLV_CAPA_DQA_SUPPORT)) {
+        XYLog("%s: AP requires DQA firmware\n", DEVNAME(sc));
+        return ENOTSUP;
+    }
+    if (sc->sc_mcast_sta_id != 0 || sc->sc_bcast_sta_id != 0) {
+        XYLog("%s: AP stations already added\n", DEVNAME(sc));
+        return 0;
+    }
+
+    mcast_id = iwm_alloc_ap_sta_id(sc);
+    bcast_id = iwm_alloc_ap_sta_id(sc);
+    if (mcast_id < 0 || bcast_id < 0) {
+        if (mcast_id >= 0)
+            iwm_free_ap_sta_id(sc, mcast_id);
+        if (bcast_id >= 0)
+            iwm_free_ap_sta_id(sc, bcast_id);
+        XYLog("%s: no free station id for AP\n", DEVNAME(sc));
+        return ENOSPC;
+    }
+
+    /*
+     * iwm_enable_txq() pokes PRPH registers and the SCD and asserts that
+     * the NIC lock is held.  The counter is re-entrant, so holding it
+     * across the ADD_STA commands below is fine -- iwm_init_hw() does the
+     * same around iwm_add_aux_sta().
+     */
+    if (!iwm_nic_lock(sc)) {
+        iwm_free_ap_sta_id(sc, mcast_id);
+        iwm_free_ap_sta_id(sc, bcast_id);
+        return EBUSY;
+    }
+
+    /* Multicast station: group-addressed data, cab queue. */
+    err = iwm_enable_txq(sc, mcast_id, IWM_DQA_GCAST_QUEUE,
+                         IWM_TX_FIFO_MCAST, 0, IWM_TID_NON_QOS, 0);
+    if (err == 0)
+        err = iwm_add_int_sta(sc, (uint8_t)mcast_id, mcast_addr,
+                              IWM_STA_MULTICAST, 1 << IWM_DQA_GCAST_QUEUE);
+    if (err != 0)
+        goto fail;
+
+    /* Broadcast station: beacons, probe responses, deauth/disassoc. */
+    err = iwm_enable_txq(sc, bcast_id, IWM_DQA_AP_PROBE_RESP_QUEUE,
+                         IWM_TX_FIFO_VO, 0, IWM_MAX_TID_COUNT, 0);
+    if (err == 0)
+        err = iwm_add_int_sta(sc, (uint8_t)bcast_id, bcast_addr,
+                              IWM_STA_GENERAL_PURPOSE,
+                              1 << IWM_DQA_AP_PROBE_RESP_QUEUE);
+    if (err != 0)
+        goto fail;
+
+    /* Rebind the management queues iwm_init_hw() gave to station 0. */
+    for (ac = 0; ac < EDCA_NUM_AC; ac++) {
+        qid = IWM_DQA_MIN_MGMT_QUEUE + ac;
+        err = iwm_enable_txq(sc, bcast_id, qid, iwm_ac_to_tx_fifo[ac],
+                             0, IWM_TID_NON_QOS, 0);
+        if (err != 0)
+            goto fail;
+    }
+
+    iwm_nic_unlock(sc);
+
+    sc->sc_mcast_sta_id = (uint8_t)mcast_id;
+    sc->sc_bcast_sta_id = (uint8_t)bcast_id;
+    XYLog("%s: AP internal stations added (mcast=%d bcast=%d)\n",
+          DEVNAME(sc), mcast_id, bcast_id);
+    return 0;
+
+fail:
+    iwm_nic_unlock(sc);
+    XYLog("%s: could not add AP stations (error %d)\n", DEVNAME(sc), err);
+    iwm_rm_ap_stas(sc);
+    return err;
+}
+
+/*
+ * Tear the internal AP stations down.  Also sweeps the node tree for client
+ * stations that were never handed back through ic_node_leave(), because
+ * iwm_deauth() runs before net80211 drops the nodes.
+ */
+int ItlIwm::
+iwm_rm_ap_stas(struct iwm_softc *sc)
+{
+    struct ieee80211com *ic = &sc->sc_ic;
+    struct ieee80211_node *ni;
+    struct iwm_node *in;
+    struct iwm_rm_sta_cmd rm;
+    int err = 0, e;
+
+    RB_FOREACH(ni, ieee80211_tree, &ic->ic_tree) {
+        in = (struct iwm_node *)ni;
+        if (ni == ic->ic_bss || !in->in_sta_added ||
+            in->in_sta_id < IWM_AP_STA_ID_MIN)
+            continue;
+        memset(&rm, 0, sizeof(rm));
+        rm.sta_id = in->in_sta_id;
+        e = iwm_send_cmd_pdu(sc, IWM_REMOVE_STA, 0, sizeof(rm), &rm);
+        if (e != 0)
+            err = e;
+        in->in_sta_added = 0;
+        iwm_free_ap_sta_id(sc, in->in_sta_id);
+        in->in_sta_id = IWM_STATION_ID;
+        XYLog("%s: removed AP client station for %s\n", DEVNAME(sc),
+              ether_sprintf(ni->ni_macaddr));
+    }
+
+    if (sc->sc_bcast_sta_id != 0) {
+        memset(&rm, 0, sizeof(rm));
+        rm.sta_id = sc->sc_bcast_sta_id;
+        e = iwm_send_cmd_pdu(sc, IWM_REMOVE_STA, 0, sizeof(rm), &rm);
+        if (e != 0)
+            err = e;
+        iwm_free_ap_sta_id(sc, sc->sc_bcast_sta_id);
+        sc->sc_bcast_sta_id = 0;
+    }
+    if (sc->sc_mcast_sta_id != 0) {
+        memset(&rm, 0, sizeof(rm));
+        rm.sta_id = sc->sc_mcast_sta_id;
+        e = iwm_send_cmd_pdu(sc, IWM_REMOVE_STA, 0, sizeof(rm), &rm);
+        if (e != 0)
+            err = e;
+        iwm_free_ap_sta_id(sc, sc->sc_mcast_sta_id);
+        sc->sc_mcast_sta_id = 0;
+    }
+
+    return err;
+}
+
 int ItlIwm::
 iwm_drain_sta(struct iwm_softc *sc, struct iwm_node *in, bool drain)
 {
@@ -521,7 +776,8 @@ iwm_rm_sta_cmd(struct iwm_softc *sc, struct iwm_node *in)
     int err;
     uint8_t qid;
     
-    if ((sc->sc_flags & IWM_FLAG_STA_ACTIVE) == 0) {
+    if (!in->in_sta_added &&
+        (sc->sc_flags & IWM_FLAG_STA_ACTIVE) == 0) {
         XYLog("sta already removed\n");
         return 0;
     }
@@ -552,7 +808,7 @@ iwm_rm_sta_cmd(struct iwm_softc *sc, struct iwm_node *in)
     if (ic->ic_opmode == IEEE80211_M_MONITOR)
         rm_sta_cmd.sta_id = IWM_MONITOR_STA_ID;
     else
-        rm_sta_cmd.sta_id = IWM_STATION_ID;
+        rm_sta_cmd.sta_id = in->in_sta_id;
     
     err = iwm_send_cmd_pdu(sc, IWM_REMOVE_STA, 0, sizeof(rm_sta_cmd),
                            &rm_sta_cmd);
@@ -560,7 +816,9 @@ done:
     sc->agg_queue_mask = 0;
     sc->agg_tid_disable = 0xffff;
     
-    sc->sc_flags &= ~IWM_FLAG_STA_ACTIVE;
+    in->in_sta_added = 0;
+    if (in->in_sta_id == IWM_STATION_ID)
+        sc->sc_flags &= ~IWM_FLAG_STA_ACTIVE;
 
     return err;
 }

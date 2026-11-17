@@ -345,6 +345,13 @@ public:
     int    iwm_add_sta_cmd(struct iwm_softc *, struct iwm_node *, int, unsigned int);
     int    iwm_add_aux_sta(struct iwm_softc *);
     int    iwm_rm_sta_cmd(struct iwm_softc *, struct iwm_node *);
+    int    iwm_add_int_sta(struct iwm_softc *, uint8_t, const uint8_t *, uint8_t,
+                           uint32_t);
+    int    iwm_alloc_ap_sta_id(struct iwm_softc *);
+    void    iwm_free_ap_sta_id(struct iwm_softc *, int);
+    static void    iwm_newassoc(struct ieee80211com *, struct ieee80211_node *,
+                                int);
+    static void    iwm_node_leave(struct ieee80211com *, struct ieee80211_node *);
     int    iwm_drain_sta(struct iwm_softc *, struct iwm_node *, bool);
     uint16_t iwm_scan_rx_chain(struct iwm_softc *);
     uint32_t iwm_scan_rate_n_flags(struct iwm_softc *, int, int);
@@ -365,7 +372,12 @@ public:
                                     struct iwm_mac_ctx_cmd *, uint32_t);
     void    iwm_mac_ctxt_cmd_fill_sta(struct iwm_softc *, struct iwm_node *,
                                       struct iwm_mac_data_sta *, int);
+    void    iwm_mac_ctxt_cmd_fill_ap(struct iwm_softc *, struct iwm_node *,
+                                     struct iwm_mac_data_ap *, int);
     int    iwm_mac_ctxt_cmd(struct iwm_softc *, struct iwm_node *, uint32_t, int);
+    int    iwm_beacon_update(struct iwm_softc *, struct iwm_node *);
+    int    iwm_add_ap_stas(struct iwm_softc *, struct iwm_node *);
+    int    iwm_rm_ap_stas(struct iwm_softc *);
     int    iwm_update_quotas(struct iwm_softc *, struct iwm_node *, int);
     void    iwm_add_task(struct iwm_softc *, struct taskq *, struct task *);
     void    iwm_del_task(struct iwm_softc *, struct taskq *, struct task *);

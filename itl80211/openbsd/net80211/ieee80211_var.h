@@ -545,6 +545,23 @@ struct ieee80211com {
 #endif
     u_int16_t       ic_deauth_reason;
     u_int16_t       ic_assoc_status;
+    /*
+     * Deferred AP (HOSTAP) bring-up/teardown.
+     *
+     * Setting up an AP requires a full INIT -> SCAN -> RUN trip through
+     * ic_newstate, which is asynchronous on the HAL side (iwm_newstate()
+     * queues work onto sc_nswq and returns immediately).  airportd on the
+     * other hand issues the AP configuration ioctls while the interface is
+     * still in INIT, so a plain ieee80211_new_state(INIT) would be dropped
+     * as a no-op by the "same state" early-out in iwm_newstate().
+     *
+     * Rather than racing the state machine we latch the request here and let
+     * iwm_newstate_task() pick it up once the queued INIT transition has
+     * actually drained:
+     *   1 == start an AP, 2 == tear the AP down and fall back to STA.
+     * iwm_stop() clears it.
+     */
+    u_int8_t        ic_ap_start_pending;
 	struct ieee80211_key	ic_nw_keys[IEEE80211_GROUP_NKID];
 	int			ic_def_txkey;	/* group data key index */
 #define ic_wep_txkey	ic_def_txkey

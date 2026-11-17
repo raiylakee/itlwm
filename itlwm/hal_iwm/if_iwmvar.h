@@ -599,7 +599,23 @@ struct iwm_softc {
 
 	int sc_intmask;
 	int sc_flags;
-    
+
+	/*
+	 * AP (hostap / Internet-Sharing) firmware bookkeeping.
+	 *
+	 * In AP mode we never create firmware station 0 for our own BSS node
+	 * (that entry belongs to a client of the AP); instead we own two
+	 * internal stations -- a broadcast one that carries beacons and probe
+	 * responses, and a multicast one that carries group-addressed data --
+	 * plus one station per associated client, allocated from
+	 * sc_sta_id_mask.  bit N of the mask is station id N.
+	 */
+	uint8_t sc_bcast_sta_id;
+	uint8_t sc_mcast_sta_id;
+	uint8_t sc_sta_id_mask;
+	uint32_t sc_ap_beacon_time;	/* GP2 captured on beacon template ADD */
+	uint32_t sc_beacon_notif_count;
+
     uint32_t sc_fh_init_mask;
     uint32_t sc_hw_init_mask;
     uint32_t sc_fh_mask;
@@ -730,6 +746,20 @@ struct iwm_node {
     uint16_t in_id;
     uint16_t in_color;
 
+    /*
+     * Firmware station-table index for this node.
+     *
+     * IWM_STATION_ID (0) is the BSS node: in STA mode it is the AP we are
+     * associated to, in AP mode it is our own MAC and carries the
+     * general-purpose station firmware uses for beacons, probe responses and
+     * group-addressed traffic.  Associated clients get a private index from
+     * iwm_alloc_sta_id(); IWM_AUX_STA_ID and IWM_MONITOR_STA_ID stay reserved
+     * for scan/ROC and monitor respectively.
+     */
+    uint8_t in_sta_id;
+    /* non-zero once IWM_ADD_STA has been issued for in_sta_id */
+    uint8_t in_sta_added;
+
     struct ieee80211_amrr_node in_amn;
     int lq_rate_mismatch;
     uint32_t next_ampdu_id;
@@ -739,6 +769,12 @@ struct iwm_node {
 #define IWM_STATION_ID 0
 #define IWM_AUX_STA_ID 1
 #define IWM_MONITOR_STA_ID 2
+/*
+ * AP stations (the internal broadcast/multicast pair plus one per client)
+ * are handed out of this range; 0..2 are spoken for above.
+ */
+#define IWM_AP_STA_ID_MIN   3
+#define IWM_AP_STA_ID_MAX   (IWM_STATION_COUNT - 1)
 
 #define IWM_ICT_SIZE        4096
 #define IWM_ICT_COUNT        (IWM_ICT_SIZE / sizeof (uint32_t))

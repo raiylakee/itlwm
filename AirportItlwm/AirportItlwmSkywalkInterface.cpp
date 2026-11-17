@@ -621,8 +621,303 @@ getRATE_SET(struct apple80211_rate_set_data *ad)
 IOReturn AirportItlwmSkywalkInterface::
 getOP_MODE(struct apple80211_opmode_data *od)
 {
+    struct ieee80211com *ic = fHalService->get80211Controller();
     od->version = APPLE80211_VERSION;
-    od->op_mode = APPLE80211_M_STA;
+    switch (ic->ic_opmode) {
+        case IEEE80211_M_HOSTAP:
+            od->op_mode = APPLE80211_M_HOSTAP;
+            break;
+        case IEEE80211_M_IBSS:
+        case IEEE80211_M_AHDEMO:
+            od->op_mode = APPLE80211_M_IBSS;
+            break;
+        case IEEE80211_M_MONITOR:
+            od->op_mode = APPLE80211_M_MONITOR;
+            break;
+        default:
+            od->op_mode = APPLE80211_M_STA;
+            break;
+    }
+    return kIOReturnSuccess;
+}
+
+/* ---------------------------------------------------------------------- *
+ *  Software AP (Internet Sharing / hotspot)
+ *
+ *  airportd never tells the driver "be an AP" in one shot: it drips the
+ *  ssid, the channel, the key and finally the mode over several ioctls, in
+ *  an order we do not control.  Everything below therefore only *records*
+ *  what was asked for and, once we have at least an ssid and a channel,
+ *  latches an AP start into ic_ap_start_pending and lets the driver's
+ *  state machine do the actual bring-up (INIT -> SCAN -> create_ibss ->
+ *  RUN -> iwm_run()).  Returning an error from any of these is not an
+ *  option: WCL treats it as a fatal configuration failure and tears the
+ *  whole link down.
+ * ---------------------------------------------------------------------- */
+
+void AirportItlwmSkywalkInterface::
+noteAPConfig(const char *what)
+{
+    struct ieee80211com *ic = fHalService->get80211Controller();
+    XYLog("itlwm: AP %s: opmode=%d state=%d pending=%d chan=%d essid_len=%u\n",
+          what, ic->ic_opmode, ic->ic_state, ic->ic_ap_start_pending,
+          ic->ic_des_chan == IEEE80211_CHAN_ANYC ?
+              0 : ieee80211_chan2ieee(ic, ic->ic_des_chan),
+          (unsigned)ic->ic_des_esslen);
+}
+
+struct ieee80211_channel *AirportItlwmSkywalkInterface::
+lookupChannel(uint32_t channel)
+{
+    struct ieee80211com *ic = fHalService->get80211Controller();
+    if (channel == 0 || channel == IEEE80211_CHAN_ANY ||
+        channel > IEEE80211_CHAN_MAX)
+        return IEEE80211_CHAN_ANYC;
+    if (ic->ic_channels[channel].ic_freq == 0)
+        return IEEE80211_CHAN_ANYC;
+    if (isclr(ic->ic_chan_active, channel))
+        return IEEE80211_CHAN_ANYC;
+    return &ic->ic_channels[channel];
+}
+
+/*
+ * Everything needed for an AP start is in place: switch the opmode and
+ * hand the request to the state machine.  ieee80211_new_state(INIT) is a
+ * no-op for net80211 when we are already in INIT, which is exactly why
+ * iwm_newstate() honours ic_ap_start_pending instead of returning early.
+ */
+IOReturn AirportItlwmSkywalkInterface::
+startAPMode(const uint8_t *ssid, uint32_t ssidLen, struct ieee80211_channel *chan)
+{
+    struct ieee80211com *ic = fHalService->get80211Controller();
+
+    if (ssid == NULL || ssidLen == 0 || ssidLen > IEEE80211_NWID_LEN) {
+        XYLog("itlwm: AP start rejected, no ssid (len=%u)\n", ssidLen);
+        noteAPConfig("start-no-ssid");
+        return kIOReturnSuccess;
+    }
+    if (chan == NULL) {
+        XYLog("itlwm: AP start rejected, no channel\n");
+        noteAPConfig("start-no-chan");
+        return kIOReturnSuccess;
+    }
+
+    /*
+     * Drop a station association first.  The AP needs the radio to itself
+     * and net80211's INIT transition only sends disassoc frames when it
+     * still thinks we are a station.
+     */
+    if (ic->ic_opmode == IEEE80211_M_STA &&
+        (ic->ic_state == IEEE80211_S_RUN || ic->ic_state == IEEE80211_S_ASSOC)) {
+        ieee80211_del_ess(ic, NULL, 0, 1);
+        ieee80211_deselect_ess(ic);
+    }
+
+    ic->ic_opmode = IEEE80211_M_HOSTAP;
+    ic->ic_flags &= ~IEEE80211_F_IBSSON;
+    ieee80211_reset_erp(ic);
+
+    memset(ic->ic_des_essid, 0, IEEE80211_NWID_LEN);
+    memcpy(ic->ic_des_essid, ssid, ssidLen);
+    ic->ic_des_esslen = ssidLen;
+    ic->ic_des_chan = chan;
+    ic->ic_ibss_chan = chan;
+    ic->ic_flags &= ~IEEE80211_F_DESBSSID;
+    IEEE80211_ADDR_COPY(ic->ic_des_bssid, etheranyaddr);
+
+    apConfigured = true;
+    noteAPConfig("start");
+
+    ic->ic_ap_start_pending = 1;
+    ieee80211_new_state(ic, IEEE80211_S_INIT, -1);
+    return kIOReturnSuccess;
+}
+
+IOReturn AirportItlwmSkywalkInterface::
+stopAPMode()
+{
+    struct ieee80211com *ic = fHalService->get80211Controller();
+
+    if (ic->ic_opmode != IEEE80211_M_HOSTAP && !apConfigured) {
+        noteAPConfig("stop-noop");
+        apModeRequested = false;
+        return kIOReturnSuccess;
+    }
+    apConfigured = false;
+    apModeRequested = false;
+    noteAPConfig("stop");
+
+    if (ic->ic_state == IEEE80211_S_INIT) {
+        /* Nothing is running: fall back immediately, no trip through the
+         * state machine required. */
+        ic->ic_opmode = IEEE80211_M_STA;
+        ic->ic_flags &= ~IEEE80211_F_IBSSON;
+        ieee80211_reset_erp(ic);
+        ic->ic_des_chan = IEEE80211_CHAN_ANYC;
+        return kIOReturnSuccess;
+    }
+
+    ic->ic_ap_start_pending = 2;
+    ieee80211_new_state(ic, IEEE80211_S_INIT, -1);
+    return kIOReturnSuccess;
+}
+
+/*
+ * Called once the recorded ssid and channel are both present *and* an AP
+ * mode has actually been requested.  A missing half is not an error:
+ * airportd is free to send them in either order, and setSSID/setCHANNEL on
+ * their own belong to an ordinary station join.
+ */
+void AirportItlwmSkywalkInterface::
+maybeStartAP(const char *why)
+{
+    if (!apModeRequested)
+        return;
+    if (apSsidLen == 0 || apChan == NULL) {
+        noteAPConfig(why);
+        return;
+    }
+    startAPMode(apSsid, apSsidLen, apChan);
+}
+
+IOReturn AirportItlwmSkywalkInterface::
+setAP_MODE(struct apple80211_apmode_data *d)
+{
+    if (!d)
+        return kIOReturnSuccess;
+    XYLog("%s apmode=%u\n", __FUNCTION__, d->apmode);
+
+    switch (d->apmode) {
+        case APPLE80211_AP_MODE_INFRA:
+        case APPLE80211_AP_MODE_ANY:
+            apModeRequested = true;
+            maybeStartAP("setAP_MODE");
+            break;
+        case APPLE80211_AP_MODE_IBSS:
+            /*
+             * Ad-hoc is requested; net80211's bring-up path is shared with
+             * hostap (ieee80211_create_ibss) but our HAL only implements
+             * the AP role, so honour it as an AP and say so.
+             */
+            XYLog("itlwm: IBSS requested, using AP mode\n");
+            apModeRequested = true;
+            maybeStartAP("setAP_MODE-ibss");
+            break;
+        case APPLE80211_AP_MODE_UNKNOWN:
+        default:
+            stopAPMode();
+            break;
+    }
+    return kIOReturnSuccess;
+}
+
+IOReturn AirportItlwmSkywalkInterface::
+setIBSS_MODE(struct apple80211_network_data *nd)
+{
+    if (!nd)
+        return kIOReturnSuccess;
+    XYLog("%s nd_mode=%u ssid_len=%u chan=%u key_len=%u\n", __FUNCTION__,
+          nd->nd_mode, nd->nd_ssid_len, nd->nd_channel.channel,
+          nd->nd_key.key_len);
+
+    if (nd->nd_ssid_len > 0 && nd->nd_ssid_len <= IEEE80211_NWID_LEN) {
+        memset(apSsid, 0, sizeof(apSsid));
+        memcpy(apSsid, nd->nd_ssid, nd->nd_ssid_len);
+        apSsidLen = nd->nd_ssid_len;
+    }
+    if (nd->nd_channel.channel != 0)
+        apChan = lookupChannel(nd->nd_channel.channel);
+
+    if (nd->nd_ssid_len == 0 && nd->nd_channel.channel == 0) {
+        /* Empty request: tear any AP down. */
+        stopAPMode();
+        return kIOReturnSuccess;
+    }
+
+    if (nd->nd_mode == APPLE80211_AP_MODE_IBSS)
+        XYLog("itlwm: IBSS requested, using AP mode\n");
+
+    apModeRequested = true;
+    maybeStartAP("setIBSS_MODE");
+    return kIOReturnSuccess;
+}
+
+/*
+ * Legacy spelling of the same request; the macOS15 protocol does not even
+ * declare it, but the older IO80211InfraProtocol does, so keep it working
+ * for the non-WCL targets.
+ */
+IOReturn AirportItlwmSkywalkInterface::
+setHOST_AP_MODE(struct apple80211_network_data *nd)
+{
+    XYLog("%s\n", __FUNCTION__);
+    return setIBSS_MODE(nd);
+}
+
+IOReturn AirportItlwmSkywalkInterface::
+setCHANNEL(struct apple80211_channel_data *cd)
+{
+    if (!cd)
+        return kIOReturnSuccess;
+    apChan = lookupChannel(cd->channel.channel);
+    XYLog("%s channel=%u -> %s\n", __FUNCTION__, cd->channel.channel,
+          apChan == IEEE80211_CHAN_ANYC ? "unusable" : "ok");
+    if (apChan == IEEE80211_CHAN_ANYC) {
+        /* An unusable channel must not be kept around: it would make every
+         * later AP start fail with "no channel". */
+        apChan = NULL;
+        return kIOReturnSuccess;
+    }
+    if (apSsidLen > 0)
+        maybeStartAP("setCHANNEL");
+    return kIOReturnSuccess;
+}
+
+IOReturn AirportItlwmSkywalkInterface::
+setSSID(struct apple80211_ssid_data *sd)
+{
+    if (!sd)
+        return kIOReturnSuccess;
+    XYLog("%s len=%u\n", __FUNCTION__, sd->ssid_len);
+
+    if (sd->ssid_len == 0 || sd->ssid_len > IEEE80211_NWID_LEN)
+        return kIOReturnSuccess;
+    memset(apSsid, 0, sizeof(apSsid));
+    memcpy(apSsid, sd->ssid_bytes, sd->ssid_len);
+    apSsidLen = sd->ssid_len;
+    if (apChan != NULL)
+        maybeStartAP("setSSID");
+    return kIOReturnSuccess;
+}
+
+/*
+ * Extra beacon/probe-response IEs.  net80211 builds its own beacon from
+ * the node state, so there is nothing sensible to store yet -- but log it
+ * so the sequence airportd actually uses is visible in the log.
+ */
+IOReturn AirportItlwmSkywalkInterface::
+setIE(struct apple80211_ie_data *ie)
+{
+    if (!ie)
+        return kIOReturnSuccess;
+    XYLog("%s frame_type=%u add=%u ie_len=%u\n", __FUNCTION__,
+          ie->frame_type_flags, ie->add, ie->ie_len);
+    return kIOReturnSuccess;
+}
+
+/*
+ * Internet Sharing asks for a virtual interface before configuring the AP.
+ * We only ever expose one interface, so acknowledge the request rather than
+ * fail it -- a failure here aborts the whole sharing setup.
+ */
+IOReturn AirportItlwmSkywalkInterface::
+setVIRTUAL_IF_CREATE(struct apple80211_virt_if_create_data *vif)
+{
+    if (!vif)
+        return kIOReturnSuccess;
+    XYLog("%s role=%u bsd_name=%.16s\n", __FUNCTION__, vif->role,
+          (const char *)vif->bsd_name);
+    noteAPConfig("virt-if-create");
     return kIOReturnSuccess;
 }
 
