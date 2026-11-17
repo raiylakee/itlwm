@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <pexpert/pexpert.h>
 
 namespace AirportWCL {
 
@@ -300,6 +301,11 @@ struct ScanTiming {
 // i.e. low latency. Splitting by default made each passive channel cost
 // ~0.8 s and full scans ~20 s. A 30 TU home time on quiet links (Linux's
 // lighter setting) coincided with firmware resets on AX210, so it is not used.
+//
+// Opt-in boot-arg itlwm_scanout=N (issue #60) raises the off-channel cap of
+// full-dwell scans while associated, clamped to 120-480 TU. The home time,
+// fragmented (low-latency) scans and unassociated scans are unchanged, and
+// nothing changes without the flag.
 inline ScanTiming scanTiming(uint32_t awayMilliseconds, bool associated,
                              bool supportsFragmentation)
 {
@@ -308,7 +314,13 @@ inline ScanTiming scanTiming(uint32_t awayMilliseconds, bool associated,
     uint64_t requested = uint64_t(awayMilliseconds) * 1000 / 1024;
     if (awayMilliseconds && requested < 100 && supportsFragmentation)
         return {requested < 44 ? 44 : uint32_t(requested), true, 95};
-    return {120, false, 120};
+    uint32_t scanout = 120;
+    PE_parse_boot_argn("itlwm_scanout", &scanout, sizeof(scanout));
+    if (scanout < 120)
+        scanout = 120;
+    if (scanout > 480)
+        scanout = 480;
+    return {scanout, false, 120};
 }
 
 inline uint16_t read16(const uint8_t *p) {
