@@ -3572,6 +3572,17 @@ iwm_newstate_task(void *psc)
             
         case IEEE80211_S_RUN:
             err = that->iwm_run(sc);
+            if (err) {
+                /*
+                 * XYLog() is kprintf(), which never reaches the unified log,
+                 * so an AP bring-up failure was invisible.  Report it where
+                 * `log show` can actually see it.
+                 */
+                IOLog("itlwm: RUN transition failed err=%d opmode=%d chan=%d\n",
+                      err, ic->ic_opmode,
+                      ic->ic_des_chan == IEEE80211_CHAN_ANYC ? 0 :
+                          ieee80211_chan2ieee(ic, ic->ic_des_chan));
+            }
             break;
     }
     
@@ -3603,8 +3614,9 @@ out:
                 int pend = ic->ic_ap_start_pending;
                 ic->ic_ap_start_pending = 0;
                 if (pend == 1 && ic->ic_opmode == IEEE80211_M_HOSTAP) {
-                    XYLog("itlwm: AP start pending -> SCAN (chan %d)\n",
-                          ieee80211_chan2ieee(ic, ic->ic_des_chan));
+                    IOLog("itlwm: AP start pending -> SCAN (chan %d essid_len=%u)\n",
+                          ieee80211_chan2ieee(ic, ic->ic_des_chan),
+                          (unsigned)ic->ic_des_esslen);
                     splx(s);
                     sc->sc_newstate(ic, IEEE80211_S_SCAN, 0);
                     return;

@@ -9,6 +9,7 @@
 #include "AirportItlwmSkywalkInterface.hpp"
 #include <sys/CTimeout.hpp>
 #include <libkern/c++/OSMetaClass.h>
+#include <IOKit/IOLib.h>
 #include <crypto/sha1.h>
 #include <net80211/ieee80211_var.h>
 #include <net80211/ieee80211_node.h>
@@ -660,7 +661,11 @@ void AirportItlwmSkywalkInterface::
 noteAPConfig(const char *what)
 {
     struct ieee80211com *ic = fHalService->get80211Controller();
-    XYLog("itlwm: AP %s: opmode=%d state=%d pending=%d chan=%d essid_len=%u\n",
+    /*
+     * IOLog, not XYLog: XYLog is kprintf() and never reaches the unified
+     * log, which made every AP bring-up failure invisible to `log show`.
+     */
+    IOLog("itlwm: AP %s: opmode=%d state=%d pending=%d chan=%d essid_len=%u\n",
           what, ic->ic_opmode, ic->ic_state, ic->ic_ap_start_pending,
           ic->ic_des_chan == IEEE80211_CHAN_ANYC ?
               0 : ieee80211_chan2ieee(ic, ic->ic_des_chan),
@@ -1359,6 +1364,20 @@ setDISASSOCIATE(struct apple80211_disassoc_data *ad)
 {
     XYLog("%s\n", __FUNCTION__);
     struct ieee80211com *ic = fHalService->get80211Controller();
+
+    /*
+     * An AP is not a station: there is no association to leave.  airportd
+     * issues a disassociate when the station link goes away, and starting
+     * the AP is exactly what makes that link go away.  Honouring it here
+     * cleared ic_des_essid and forced SCAN, silently killing the AP we had
+     * just brought up -- which is why the driver settled at
+     * opmode=HOSTAP / state=SCAN / ssid="".
+     */
+    if (apConfigured || ic->ic_opmode == IEEE80211_M_HOSTAP) {
+        IOLog("itlwm: AP ignoring setDISASSOCIATE (opmode=%d state=%d essid_len=%u)\n",
+              ic->ic_opmode, ic->ic_state, (unsigned)ic->ic_des_esslen);
+        return kIOReturnSuccess;
+    }
 
     if (ic->ic_state < IEEE80211_S_SCAN)
         return kIOReturnSuccess;
