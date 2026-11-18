@@ -9,13 +9,13 @@
  * Build: clang -framework Foundation -framework IOKit -o hotspot hotspot.m
  *
  * Usage:
- *   hotspot probe              read-only: show driver opmode/state/SSID/channel
- *   hotspot start <ssid> [ch]  start the AP (open network), default channel 6
- *   hotspot stop               stop the AP, return to STA
+ *   hotspot probe                     read-only: show driver state
+ *   hotspot start <ssid> [ch] [pass]   start AP; pass enables WPA2-PSK
+ *   hotspot stop                      stop the AP, return to STA
  *
- * NOTE: the driver's AP is OPEN (no WPA2).  The AP-side 4-way handshake lives
- * in airportd's userspace RSNA, which we deliberately bypass.  WPA2 would
- * require porting that handshake into this tool or the kext.
+ * NOTE: WPA2-PSK is handled entirely in-driver.  The passphrase is derived to
+ * a PMK with PBKDF2 in the kext, and net80211's built-in 4-way authenticator
+ * runs the handshake with each station.  No passphrase crosses into airportd.
  * NOTE: AP mode is EXCLUSIVE - it tears down any STA link.  Upstream internet
  * must come from a different interface (Ethernet / USB tether) + NAT.
  */
@@ -95,7 +95,7 @@ do_probe(void)
 }
 
 static int
-do_start(const char *ssid, int channel)
+do_start(const char *ssid, int channel, const char *password)
 {
     if (!ssid || strlen(ssid) == 0 || strlen(ssid) > 32) {
         fprintf(stderr, "SSID must be 1-32 bytes\n");
@@ -103,12 +103,20 @@ do_start(const char *ssid, int channel)
     }
     if (channel == 0) channel = 6;
 
+    size_t passlen = password ? strlen(password) : 0;
+    if (passlen != 0 && (passlen < 8 || passlen > 63)) {
+        fprintf(stderr, "WPA2 passphrase must be 8-63 characters\n");
+        return 2;
+    }
+
     struct itl_hotspot_start in;
     memset(&in, 0, sizeof(in));
     in.version = ITL_HOTSPOT_VERSION;
     in.ssid_len = (uint32_t)strlen(ssid);
     memcpy(in.ssid, ssid, in.ssid_len);
     in.channel = (uint32_t)channel;
+    in.password_len = (uint32_t)passlen;
+    if (passlen) memcpy(in.password, password, passlen);
 
     kern_return_t kr = IOConnectCallStructMethod(gConn, kItlHotspotStartAP,
                                                  &in, sizeof(in), NULL, NULL);
@@ -116,7 +124,8 @@ do_start(const char *ssid, int channel)
         fprintf(stderr, "start call failed: 0x%x (%s)\n", kr, mach_error_string(kr));
         return 1;
     }
-    printf("AP start requested: ssid=\"%s\" channel=%d\n", ssid, channel);
+    printf("AP start requested: ssid=\"%s\" channel=%d security=%s\n",
+           ssid, channel, passlen ? "WPA2-PSK" : "open");
     printf("Verify with: hotspot probe\n");
     printf("Check driver log: log show --last 2m --predicate 'eventMessage CONTAINS[c] \"itlwm: AP\"'\n");
     return 0;
@@ -140,13 +149,14 @@ usage(void)
 {
     fprintf(stderr,
         "usage:\n"
-        "  hotspot probe              show driver opmode/state/SSID/channel\n"
-        "  hotspot start <ssid> [ch]  start open AP (default channel 6)\n"
-        "  hotspot stop               stop AP, return to STA\n"
+        "  hotspot probe                       show driver opmode/state/SSID/channel\n"
+        "  hotspot start <ssid> [ch] [pass]    start AP (ch default 6; pass = WPA2-PSK)\n"
+        "  hotspot stop                        stop AP, return to STA\n"
         "\n"
         "Examples:\n"
         "  hotspot probe\n"
-        "  hotspot start MyHotspot 6\n"
+        "  hotspot start MyHotspot 6 mypassword   (WPA2-PSK)\n"
+        "  hotspot start OpenNet 6                (open AP)\n"
         "  hotspot stop\n");
 }
 
@@ -162,7 +172,11 @@ main(int argc, char **argv)
             rc = do_probe();
         } else if (!strcmp(argv[1], "start")) {
             if (argc < 3) { usage(); rc = 2; }
-            else rc = do_start(argv[2], argc >= 4 ? atoi(argv[3]) : 6);
+            else {
+                int ch = argc >= 4 ? atoi(argv[3]) : 6;
+                const char *pass = argc >= 5 ? argv[4] : NULL;
+                rc = do_start(argv[2], ch, pass);
+            }
         } else if (!strcmp(argv[1], "stop")) {
             rc = do_stop();
         } else {

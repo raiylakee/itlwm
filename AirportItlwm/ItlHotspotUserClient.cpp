@@ -79,6 +79,14 @@ ItlHotspotUserClient::startAP(const itl_hotspot_start *in)
     uint32_t channel = in->channel ? in->channel : 6;
     if (channel > IEEE80211_CHAN_MAX)
         return kIOReturnBadArgument;
+    if (in->password_len > 63)
+        return kIOReturnBadArgument;
+    if (in->password_len != 0 && in->password_len < 8)
+        return kIOReturnBadArgument; /* WPA2 passphrase is 8..63 chars */
+
+    /* Latch the passphrase first: setSSID/setCHANNEL can each trigger an
+     * early maybeStartAP(), so the password must be in place before them. */
+    fSkywalk->setAPPassword(in->password, in->password_len);
 
     apple80211_ssid_data sd;
     memset(&sd, 0, sizeof(sd));
@@ -110,8 +118,8 @@ ItlHotspotUserClient::startAP(const itl_hotspot_start *in)
     if (r != kIOReturnSuccess)
         return r;
 
-    IOLog("ItlHotspotUserClient: AP start requested (ssid_len=%u ch=%u)\n",
-          in->ssid_len, channel);
+    IOLog("ItlHotspotUserClient: AP start requested (ssid_len=%u ch=%u sec=%s)\n",
+          in->ssid_len, channel, in->password_len ? "WPA2-PSK" : "open");
     return kIOReturnSuccess;
 }
 
@@ -126,6 +134,7 @@ ItlHotspotUserClient::stopAP()
     ad.version = APPLE80211_VERSION;
     ad.apmode = APPLE80211_AP_MODE_UNKNOWN;
     fSkywalk->setAP_MODE(&ad);
+    fSkywalk->setAPPassword(NULL, 0); /* do not leak PSK into a later open AP */
 
     IOLog("ItlHotspotUserClient: AP stop requested\n");
     return kIOReturnSuccess;

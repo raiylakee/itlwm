@@ -31,6 +31,8 @@ struct itl_hotspot_start {
     uint32_t ssid_len;      /* 1..32 */
     uint8_t  ssid[32];
     uint32_t channel;       /* wifi channel number; 0 => default 6 */
+    uint32_t password_len;  /* 0 = open AP, else 8..63 (WPA2 passphrase) */
+    uint8_t  password[64];  /* ASCII passphrase; NUL terminator not required */
     uint32_t reserved[4];
 };
 

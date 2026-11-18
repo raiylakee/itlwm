@@ -289,6 +289,9 @@ public:
     virtual IOReturn getWIFI_NOISE_PER_ANT(apple80211_noise_per_ant_t *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getBLOCKED_BANDS(apple80211_blocked_bands *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setSSID(apple80211_ssid_data *) AIRPORT_SKYWALK_OVERRIDE;
+    /* Store the WPA2 passphrase for the next AP start (len 0 = open AP).
+     * This is an itlwm extension, not an Apple 802.11 ioctl. */
+    void setAPPassword(const uint8_t *password, uint32_t passwordLen);
     virtual IOReturn setAUTH_TYPE(apple80211_authtype_data *) AIRPORT_SKYWALK_OVERRIDE;
     virtual IOReturn setCIPHER_KEY(apple80211_key *) AIRPORT_SKYWALK_OVERRIDE;
     virtual IOReturn setCHANNEL(apple80211_channel_data *) AIRPORT_SKYWALK_OVERRIDE;
@@ -521,6 +524,10 @@ private:
      */
     IOReturn startAPMode(const uint8_t *ssid, uint32_t ssidLen,
                          struct ieee80211_channel *chan);
+    /* Configure WPA2-PSK (derive PMK from passphrase + SSID) for the AP.
+     * passwordLen == 0 leaves the AP open. */
+    void configureAPSecurity(const uint8_t *ssid, uint32_t ssidLen,
+                             const uint8_t *password, uint32_t passwordLen);
     IOReturn stopAPMode();
     struct ieee80211_channel *lookupChannel(uint32_t channel);
     void noteAPConfig(const char *what);
@@ -539,6 +546,8 @@ private:
     uint8_t apSsid[APPLE80211_MAX_SSID_LEN] = {};
     uint32_t apSsidLen = 0;
     struct ieee80211_channel *apChan = nullptr;
+    uint8_t apPassword[64] = {};
+    uint32_t apPasswordLen = 0;
 
     //IO80211
     struct ieee80211_node *fNextNodeToSend;

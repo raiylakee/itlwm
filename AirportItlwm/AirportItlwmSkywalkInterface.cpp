@@ -10,6 +10,7 @@
 #include <sys/CTimeout.hpp>
 #include <libkern/c++/OSMetaClass.h>
 #include <crypto/sha1.h>
+#include <net80211/ieee80211_var.h>
 #include <net80211/ieee80211_node.h>
 #include <net80211/ieee80211_ioctl.h>
 #include <net80211/ieee80211_priv.h>
@@ -681,6 +682,58 @@ lookupChannel(uint32_t channel)
 }
 
 /*
+ * Derive the AP's PMK from a WPA2 passphrase and turn on RSN/PSK.  The
+ * in-driver 4-way authenticator (ieee80211_pae_input.c) picks up ic_psk on
+ * association and sends msg1; the beacon advertises the RSN IE built from
+ * these parameters.  passwordLen == 0 restores an open AP.
+ */
+void AirportItlwmSkywalkInterface::
+configureAPSecurity(const uint8_t *ssid, uint32_t ssidLen,
+                    const uint8_t *password, uint32_t passwordLen)
+{
+    struct ieee80211com *ic = fHalService->get80211Controller();
+    if (!ic)
+        return;
+
+    /* Always start from a clean RSN state so a previous start's PSK does
+     * not leak into an open AP (and vice versa). */
+    ieee80211_disable_rsn(ic);
+
+    if (passwordLen == 0 || !password)
+        return; /* open AP */
+
+    /* PBKDF2 uses strlen() on the passphrase, so it must be NUL-terminated.
+     * WPA2 passphrases are 8..63 printable ASCII characters. */
+    if (passwordLen < 8 || passwordLen > 63)
+        return;
+    char passphrase[64];
+    memcpy(passphrase, password, passwordLen);
+    passphrase[passwordLen] = '\0';
+
+    uint8_t pmk[IEEE80211_PMK_LEN];
+    if (pbkdf2_sha1(passphrase, ssid, ssidLen, 4096, pmk, sizeof(pmk)) != 0) {
+        XYLog("itlwm: AP PBKDF2 failed; leaving AP open\n");
+        return;
+    }
+
+    memcpy(ic->ic_psk, pmk, sizeof(ic->ic_psk));
+    explicit_bzero(pmk, sizeof(pmk));
+    ic->ic_flags |= IEEE80211_F_PSK;
+
+    struct ieee80211_wpaparams wpa;
+    bzero(&wpa, sizeof(wpa));
+    wpa.i_enabled = 1;
+    wpa.i_protos = IEEE80211_WPA_PROTO_WPA2;
+    wpa.i_akms = IEEE80211_WPA_AKM_PSK;
+    wpa.i_ciphers = IEEE80211_WPA_CIPHER_CCMP;
+    wpa.i_groupcipher = IEEE80211_WPA_CIPHER_CCMP;
+    ieee80211_ioctl_setwpaparms(ic, &wpa);   /* sets IEEE80211_F_RSNON */
+
+    XYLog("itlwm: AP WPA2-PSK configured (ssid_len=%u passphrase_len=%u)\n",
+          ssidLen, passwordLen);
+}
+
+/*
  * Everything needed for an AP start is in place: switch the opmode and
  * hand the request to the state machine.  ieee80211_new_state(INIT) is a
  * no-op for net80211 when we are already in INIT, which is exactly why
@@ -722,6 +775,12 @@ startAPMode(const uint8_t *ssid, uint32_t ssidLen, struct ieee80211_channel *cha
     ic->ic_des_esslen = ssidLen;
     ic->ic_des_chan = chan;
     ic->ic_ibss_chan = chan;
+
+    /* Derive and install the WPA2 PMK before the state machine brings the
+     * BSS up, so the beacon advertises RSN and association starts the 4-way
+     * handshake with a PSK already in place. */
+    configureAPSecurity(ic->ic_des_essid, ic->ic_des_esslen,
+                        apPassword, apPasswordLen);
     ic->ic_flags &= ~IEEE80211_F_DESBSSID;
     IEEE80211_ADDR_COPY(ic->ic_des_bssid, etheranyaddr);
 
@@ -871,6 +930,19 @@ setCHANNEL(struct apple80211_channel_data *cd)
     if (apSsidLen > 0)
         maybeStartAP("setCHANNEL");
     return kIOReturnSuccess;
+}
+
+void AirportItlwmSkywalkInterface::
+setAPPassword(const uint8_t *password, uint32_t passwordLen)
+{
+    memset(apPassword, 0, sizeof(apPassword));
+    apPasswordLen = 0;
+    if (!password || passwordLen == 0)
+        return; /* open AP */
+    if (passwordLen > sizeof(apPassword))
+        passwordLen = sizeof(apPassword);
+    memcpy(apPassword, password, passwordLen);
+    apPasswordLen = passwordLen;
 }
 
 IOReturn AirportItlwmSkywalkInterface::

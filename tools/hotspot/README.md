@@ -58,20 +58,26 @@ clang -Wall -Wextra -framework Foundation -framework IOKit \
 ## Usage
 
 ```sh
-./hotspot probe              # driver opmode / state / SSID / channel
-./hotspot start MyHotspot 6  # start the AP on channel 6
-./hotspot stop               # stop the AP, return to station mode
+./hotspot probe                             # driver opmode / state / SSID / channel
+./hotspot start MyHotspot 6 mypassword      # start WPA2-PSK AP on channel 6
+./hotspot start OpenNet 6                   # start an OPEN AP (no passphrase)
+./hotspot stop                              # stop the AP, return to station mode
 ```
+
+The optional passphrase (8-63 characters) enables WPA2-PSK. It is derived to
+a PMK with PBKDF2 inside the kext, and net80211's built-in 4-way
+authenticator handles each station's handshake. No passphrase is sent to
+airportd or any Apple framework.
 
 `probe` is read-only. It is the first thing to run after rebooting into the
 rebuilt kext: if `IOServiceOpen` succeeds, the control channel works.
 
 ## Important limitations
 
-- **Open network only.** The kext's AP path does not set a passphrase, and the
-  WPA2 4-way authenticator is not wired up in this driver. The password you
-  supplied earlier cannot be used by this AP. WPA2 would need the
-  authenticator handshake implemented in the kext.
+- **WPA2-PSK supported; WPA3/Enterprise are not.** The passphrase is derived
+  to a PMK with PBKDF2 (SHA1, 4096 iterations) and the in-driver net80211
+  4-way authenticator handles WPA2-PSK/CCMP. Omit the passphrase for an open
+  AP. WPA3-SAE and 802.1X (Enterprise) are not implemented.
 - **Exclusive AP.** Starting the AP tears down any station association. The
   shared upstream connection must come from a different interface (Ethernet
   or USB tether) with NAT configured. This cannot repeat Wi-Fi to Wi-Fi on
