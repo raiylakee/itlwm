@@ -26,6 +26,8 @@
 			<string>com.zxystd.AirportItlwm</string>
 			<key>IOClass</key>
 			<string>AirportItlwm</string>
+			<key>IOUserClientClass</key>
+			<string>ItlHotspotUserClient</string>
 			<key>IOMatchCategory</key>
 			<string>WiFiDriver</string>
 			<key>IONetworkRootType</key>
